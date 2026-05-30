@@ -199,7 +199,21 @@ ICONS = {
 def _render_terminal():
     text = "\n".join(st.session_state.log) if st.session_state.log else "Ready."
     safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    return f'<div class="terminal">{safe}</div>'
+    line_count = len(st.session_state.log)
+    return f"""
+<div class="terminal-wrap" id="term-wrap">
+  <div class="term-toolbar">
+    <span>💻 Agent Terminal &nbsp;·&nbsp; {line_count} lines</span>
+    <span>
+      <button onclick="scrollTerminal()" title="Scroll to bottom">⬇ Bottom</button>
+      &nbsp;
+      <button id="fs-btn" onclick="toggleFS()" title="Toggle fullscreen">⛶ Fullscreen</button>
+    </span>
+  </div>
+  <div class="terminal" id="term-body">{safe}</div>
+</div>
+<script>scrollTerminal();</script>
+"""
 
 
 def log(msg: str, kind: str = "info", term_ph=None, stats_phs=None):
@@ -1197,6 +1211,9 @@ def run_agent(target: str, user_payload: str, max_depth: int,
 # ═══════════════════════════════════ UI ═══════════════════════════════════════
 st.markdown("""
 <style>
+.terminal-wrap {
+    position: relative;
+}
 .terminal {
     background: #0d1117;
     color: #39ff14;
@@ -1209,8 +1226,77 @@ st.markdown("""
     white-space: pre-wrap;
     border: 1px solid #238636;
     line-height: 1.55;
+    scroll-behavior: smooth;
 }
+/* fullscreen overlay */
+.terminal-wrap.fs-active {
+    position: fixed;
+    top: 0; left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 99999;
+    background: #0d1117;
+    border-radius: 0;
+    padding: 0;
+}
+.terminal-wrap.fs-active .terminal {
+    height: calc(100vh - 44px);
+    border-radius: 0;
+    border: none;
+    font-size: 13.5px;
+}
+.term-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #161b22;
+    border: 1px solid #238636;
+    border-bottom: none;
+    border-radius: 8px 8px 0 0;
+    padding: 4px 10px;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    color: #58a6ff;
+}
+.terminal-wrap.fs-active .term-toolbar {
+    border-radius: 0;
+    border: none;
+    border-bottom: 1px solid #238636;
+}
+.term-toolbar button {
+    background: none;
+    border: 1px solid #238636;
+    color: #39ff14;
+    border-radius: 4px;
+    padding: 2px 10px;
+    cursor: pointer;
+    font-size: 12px;
+}
+.term-toolbar button:hover { background: #238636; color: #fff; }
 </style>
+
+<script>
+function toggleFS() {
+    var w = document.getElementById('term-wrap');
+    var btn = document.getElementById('fs-btn');
+    w.classList.toggle('fs-active');
+    btn.textContent = w.classList.contains('fs-active') ? '✕ Exit Fullscreen' : '⛶ Fullscreen';
+}
+function scrollTerminal() {
+    var t = document.getElementById('term-body');
+    if (t) t.scrollTop = t.scrollHeight;
+}
+// auto-scroll on any DOM mutation inside the terminal
+(function() {
+    var obs = new MutationObserver(function() { scrollTerminal(); });
+    function attach() {
+        var t = document.getElementById('term-body');
+        if (t) { obs.observe(t, {childList:true, characterData:true, subtree:true}); }
+        else    { setTimeout(attach, 300); }
+    }
+    attach();
+})();
+</script>
 """, unsafe_allow_html=True)
 
 st.title("🕷️ XSS Autonomous Agent")
@@ -1259,7 +1345,6 @@ s_phs = tuple(col.empty() for col in sc)
 _render_stats(*s_phs)
 
 # ── Terminal ──────────────────────────────────────────────────────────────────
-st.subheader("💻 Agent Terminal")
 term_ph = st.empty()
 term_ph.markdown(_render_terminal(), unsafe_allow_html=True)
 
