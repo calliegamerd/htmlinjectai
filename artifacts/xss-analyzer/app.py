@@ -212,24 +212,39 @@ html,body{{height:{th}px;overflow:hidden;background:#0d1117;
 }})();
 
 function toggleFS(){{
-  var el=document.documentElement;
-  if(!document.fullscreenElement&&!document.webkitFullscreenElement){{
+  var fr=window.frameElement;
+  var t=document.getElementById('term');
+  var btn=document.getElementById('fsbtn');
+  if(!fr){{
+    // fallback: native fullscreen on the doc itself
+    var el=document.documentElement;
     var fn=el.requestFullscreen||el.webkitRequestFullscreen||el.mozRequestFullScreen;
     if(fn)fn.call(el);
+    return;
+  }}
+  if(fr._xssFS){{
+    // restore
+    fr.style.cssText=fr._xssSaved||'';
+    fr._xssFS=false;
+    t.style.height='{body_h}px';
+    btn.textContent='⛶ Fullscreen';
   }}else{{
-    var ex=document.exitFullscreen||document.webkitExitFullscreen||document.mozCancelFullScreen;
-    if(ex)ex.call(document);
+    // expand iframe to cover the parent viewport
+    fr._xssSaved=fr.style.cssText||'';
+    fr.style.cssText=[
+      'position:fixed','top:0','left:0',
+      'width:100vw','height:100vh',
+      'z-index:2147483647','border:none',
+      'background:#0d1117'
+    ].join('!important;')+'!important';
+    fr._xssFS=true;
+    t.style.height='calc(100vh - 38px)';
+    btn.textContent='✕ Exit Fullscreen';
+    t.scrollTop=t.scrollHeight;
+    // scroll parent to top so iframe is visible
+    try{{window.parent.scrollTo(0,0);}}catch(e){{}}
   }}
 }}
-['fullscreenchange','webkitfullscreenchange'].forEach(function(ev){{
-  document.addEventListener(ev,function(){{
-    var inFS=!!(document.fullscreenElement||document.webkitFullscreenElement);
-    document.getElementById('fsbtn').textContent=inFS?'✕ Exit Fullscreen':'⛶ Fullscreen';
-    // re-scroll after resize
-    var t=document.getElementById('term');
-    t.scrollTop=t.scrollHeight;
-  }});
-}});
 </script>
 </body></html>"""
 
