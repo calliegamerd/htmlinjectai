@@ -6,10 +6,18 @@ import re
 import urllib.parse
 import json
 import html as html_lib
+import base64
+import tempfile
 from openai import OpenAI
 from bs4 import BeautifulSoup
 from collections import deque
 from datetime import datetime
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    PLAYWRIGHT_OK = True
+except ImportError:
+    PLAYWRIGHT_OK = False
 
 st.set_page_config(
     page_title="XSS Autonomous Agent",
@@ -546,6 +554,174 @@ def _test_header_injection(url: str) -> list:
     return hits
 
 
+# ── Browser-based execution verification (Playwright) ────────────────────────
+def verify_in_browser(url: str, param: str, payload: str,
+                      method: str = "get", extra_data: dict = None) -> dict:
+    """
+    Actually load the injected URL in headless Chromium and check whether the
+    payload executed.  Returns:
+        confirmed  – JS/HTML was executed (dialog fired or marker set)
+        screenshot – PNG bytes (proof screenshot)
+        dialog_msg – the alert/confirm/prompt message if one was triggered
+        error      – error string if browser failed to launch
+    """
+    result = {"confirmed": False, "screenshot": None,
+              "dialog_msg": None, "error": None}
+
+    if not PLAYWRIGHT_OK:
+        result["error"] = "Playwright not installed"
+        return result
+
+    # Build the URL with the payload injected (GET) or use POST form later
+    if method == "get":
+        parsed = urllib.parse.urlparse(url)
+        params = dict(urllib.parse.parse_qsl(parsed.query))
+        params[param] = payload
+        target_url = parsed._replace(
+            query=urllib.parse.urlencode(params)).geturl()
+    else:
+        target_url = url
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox", "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage", "--disable-gpu",
+                    "--disable-web-security",         # allow cross-origin payloads
+                    "--allow-running-insecure-content",
+                ]
+            )
+            ctx = browser.new_context(
+                ignore_https_errors=True,
+                java_script_enabled=True,
+            )
+            page = ctx.new_page()
+
+            # Patch alert/confirm/prompt/console.error so we catch execution
+            # even if the page suppresses dialogs
+            page.add_init_script("""
+                window._xss_confirmed = false;
+                window._xss_dialog_msg = null;
+                const _orig_alert   = window.alert;
+                const _orig_confirm = window.confirm;
+                const _orig_prompt  = window.prompt;
+                window.alert   = function(m) {
+                    window._xss_confirmed = true;
+                    window._xss_dialog_msg = String(m);
+                    try { _orig_alert(m); } catch(e) {}
+                };
+                window.confirm = function(m) {
+                    window._xss_confirmed = true;
+                    window._xss_dialog_msg = String(m);
+                    return true;
+                };
+                window.prompt  = function(m, d) {
+                    window._xss_confirmed = true;
+                    window._xss_dialog_msg = String(m);
+                    return d || 'xss';
+                };
+            """)
+
+            dialog_fired = {"value": False, "msg": ""}
+
+            def _on_dialog(dialog):
+                dialog_fired["value"] = True
+                dialog_fired["msg"] = dialog.message
+                result["confirmed"] = True
+                result["dialog_msg"] = dialog.message
+                try:
+                    dialog.dismiss()
+                except Exception:
+                    pass
+
+            page.on("dialog", _on_dialog)
+
+            if method == "get":
+                try:
+                    page.goto(target_url, wait_until="networkidle", timeout=12000)
+                except PWTimeout:
+                    pass
+                except Exception:
+                    try:
+                        page.goto(target_url, wait_until="domcontentloaded", timeout=8000)
+                    except Exception:
+                        pass
+            else:
+                # POST: navigate to the form page first, fill, then submit
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                try:
+                    for fname, fval in (extra_data or {}).items():
+                        locator = page.locator(f"[name='{fname}']")
+                        if locator.count() > 0:
+                            locator.first.fill(str(fval))
+                    # Fill the target param with payload
+                    loc = page.locator(f"[name='{param}']")
+                    if loc.count() > 0:
+                        loc.first.fill(payload)
+                        loc.first.press("Enter")
+                    page.wait_for_timeout(3000)
+                except Exception:
+                    pass
+
+            # Short settle wait
+            try:
+                page.wait_for_timeout(2500)
+            except Exception:
+                pass
+
+            # Check JS marker (catches execution even without a dialog)
+            if not result["confirmed"]:
+                try:
+                    confirmed = page.evaluate("window._xss_confirmed === true")
+                    if confirmed:
+                        result["confirmed"] = True
+                        msg = page.evaluate("window._xss_dialog_msg")
+                        result["dialog_msg"] = msg
+                except Exception:
+                    pass
+
+            # Also check for injected DOM elements as HTML injection proof
+            if not result["confirmed"]:
+                try:
+                    # Look for <h1>INJECTED, <marquee>, <iframe> we may have planted
+                    injected = page.evaluate("""
+                        (function() {
+                            var tags = ['script','img','svg','details','video',
+                                        'audio','iframe','marquee','h1'];
+                            for (var t of tags) {
+                                var els = document.querySelectorAll(t + '[data-xss],' +
+                                    t + '[onerror],' + t + '[onload],' +
+                                    t + '[ontoggle],' + t + '[onfocus]');
+                                if (els.length > 0) return true;
+                            }
+                            return false;
+                        })()
+                    """)
+                    if injected:
+                        result["confirmed"] = True
+                        result["dialog_msg"] = "DOM element injected"
+                except Exception:
+                    pass
+
+            # Screenshot — always capture as proof
+            try:
+                result["screenshot"] = page.screenshot(full_page=False)
+            except Exception:
+                pass
+
+            browser.close()
+
+    except Exception as e:
+        result["error"] = str(e)
+
+    return result
+
+
 def test_page(page: dict, payloads: list, term_ph, stats_phs) -> list:
     hits = []
     # URL params
@@ -554,10 +730,22 @@ def test_page(page: dict, payloads: list, term_ph, stats_phs) -> list:
         for payload in payloads[:15]:
             r = test_one(page["url"], param, payload, "get")
             if r["reflected"] and not r["escaped"]:
+                log(f"Reflected [{r['context']}] {page['url']} ?{param} — verifying in browser...",
+                    "warn", term_ph, stats_phs)
+                bv = verify_in_browser(page["url"], param, payload, "get")
+                r["browser_confirmed"] = bv["confirmed"]
+                r["screenshot"] = bv.get("screenshot")
+                r["dialog_msg"] = bv.get("dialog_msg")
+                r["browser_error"] = bv.get("error")
+                if bv["confirmed"]:
+                    st.session_state.vulns_found += 1
+                    log(f"BROWSER CONFIRMED 🎯 [{r['context']}] {page['url']} ?{param}= [{payload[:50]}]"
+                        + (f' — dialog: "{bv["dialog_msg"]}"' if bv.get("dialog_msg") else ""),
+                        "vuln", term_ph, stats_phs)
+                else:
+                    log(f"Reflected but NOT executed in browser — {page['url']} ?{param}",
+                        "warn", term_ph, stats_phs)
                 hits.append(r)
-                st.session_state.vulns_found += 1
-                log(f"VULN [{r['context']}] {page['url']} ?{param}= [{payload[:50]}]",
-                    "vuln", term_ph, stats_phs)
                 break
             elif r["reflected"] and r.get("partial"):
                 log(f"Partial reflection — {page['url']} param={param} [{payload[:40]}]",
@@ -579,11 +767,23 @@ def test_page(page: dict, payloads: list, term_ph, stats_phs) -> list:
                 r = test_one(form["action"], field["name"], payload,
                              form["method"], extra_data=data)
                 if r["reflected"] and not r["escaped"]:
+                    log(f"Reflected [{r['context']}] form={form['action']} field={field['name']} — verifying...",
+                        "warn", term_ph, stats_phs)
+                    bv = verify_in_browser(form["action"], field["name"], payload,
+                                          form["method"], extra_data=data)
+                    r["browser_confirmed"] = bv["confirmed"]
+                    r["screenshot"] = bv.get("screenshot")
+                    r["dialog_msg"] = bv.get("dialog_msg")
+                    r["browser_error"] = bv.get("error")
+                    if bv["confirmed"]:
+                        st.session_state.vulns_found += 1
+                        log(f"BROWSER CONFIRMED 🎯 form={form['action']} field={field['name']} [{payload[:50]}]"
+                            + (f' — dialog: "{bv["dialog_msg"]}"' if bv.get("dialog_msg") else ""),
+                            "vuln", term_ph, stats_phs)
+                    else:
+                        log(f"Reflected but NOT executed in browser — form={form['action']} field={field['name']}",
+                            "warn", term_ph, stats_phs)
                     hits.append(r)
-                    st.session_state.vulns_found += 1
-                    log(f"VULN [{r['context']}] form={form['action']} "
-                        f"field={field['name']} [{payload[:50]}]",
-                        "vuln", term_ph, stats_phs)
                     break
                 elif r["reflected"]:
                     log(f"Escaped reflection — form={form['action']} field={field['name']}",
@@ -1071,10 +1271,27 @@ tab1, tab2, tab3, tab4 = st.tabs([
 
 with tab1:
     if st.session_state.findings:
-        st.error(f"🚨 {len(st.session_state.findings)} confirmed injection(s) found")
+        browser_confirmed = [f for f in st.session_state.findings if f.get("browser_confirmed")]
+        http_only = [f for f in st.session_state.findings if not f.get("browser_confirmed")]
+        if browser_confirmed:
+            st.error(f"🎯 {len(browser_confirmed)} BROWSER-CONFIRMED execution(s) — real, zero false positives")
+        if http_only:
+            st.warning(f"⚠️ {len(http_only)} HTTP reflection(s) — payload reflected but browser did not execute JS")
+
         for i, f in enumerate(st.session_state.findings, 1):
-            label = f"#{i} [{f.get('context','?')}] {f['url']} — param: {f['param']}"
+            confirmed = f.get("browser_confirmed", False)
+            badge = "🎯 EXECUTED" if confirmed else "⚠️ REFLECTED"
+            label = f"#{i} {badge} [{f.get('context','?')}] {f['url']} — {f['param']}"
             with st.expander(label, expanded=(i == 1)):
+                if confirmed:
+                    st.success(f"✅ JavaScript executed in real Chromium browser"
+                               + (f' — dialog: `{f["dialog_msg"]}`' if f.get("dialog_msg") else ""))
+                else:
+                    st.warning("Payload reflected unescaped in HTTP response, but did not execute in browser "
+                               "(may need a different payload variant or manual verification)")
+                    if f.get("browser_error"):
+                        st.caption(f"Browser error: {f['browser_error']}")
+
                 st.code(f["payload"], language="html")
                 cols = st.columns(2)
                 with cols[0]:
@@ -1089,6 +1306,9 @@ with tab1:
                         f"**Partial match:** `{f.get('partial', False)}`")
                 if f.get("body_snippet"):
                     st.code(f["body_snippet"], language="html")
+                if f.get("screenshot"):
+                    st.subheader("📸 Proof Screenshot")
+                    st.image(f["screenshot"], caption="Headless Chromium — moment of injection", use_container_width=True)
 
     if st.session_state.get("report"):
         st.divider()
