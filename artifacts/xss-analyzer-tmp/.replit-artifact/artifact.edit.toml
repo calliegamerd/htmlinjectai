@@ -1,0 +1,11 @@
+[artifact]
+version = "2"
+kind = "web"
+title = "XSS Analyzer"
+previewPath = "/"
+
+[[services]]
+name = "web"
+localPort = 5000
+command = "python3 -m streamlit run artifacts/xss-analyzer/app.py --server.port 5000"
+waitForPort = 5000

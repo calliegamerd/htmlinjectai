@@ -1,45 +1,43 @@
-# [Project name]
+# XSS & HTML Injection Analyzer
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A white-hat security tool that analyzes HTML and web application source code for XSS and HTML Injection vulnerabilities, backed by DeepSeek R1 via OpenRouter.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- `python3 -m streamlit run artifacts/xss-analyzer/app.py --server.port 5000` — run the Streamlit app
+- Required secret: `OPENROUTER_API_KEY` — OpenRouter API key for DeepSeek R1
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Python 3.11, Streamlit
+- OpenAI SDK (pointed at OpenRouter, model: `deepseek/deepseek-r1`)
+- requests, BeautifulSoup4, lxml
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
-
-## Architecture decisions
-
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- `artifacts/xss-analyzer/app.py` — entire application (analyzer, PoC prober, terminal, chat)
+- `artifacts/xss-analyzer/.streamlit/config.toml` — Streamlit server config (port 5000)
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Four tabs:
+1. **Code Analyzer** — paste or upload source code, optionally set a target URL and focus area, get a structured AI security report
+2. **PoC Injection Tester** — send real XSS payloads to a target URL parameter and check if they reflect unescaped
+3. **Linux Terminal** — run shell commands (curl, nmap, whatweb, etc.) against targets; presets for common recon
+4. **Follow-up Chat** — conversational follow-up with the AI auditor within the current analysis context
+
+## Architecture decisions
+
+- Token budget enforced: 3-turn conversation history cap, code truncated to 8000 chars (high-risk blocks prioritized), max_tokens=1200 per API call
+- Code extraction targets dangerous patterns (innerHTML, eval, echo $, req.body, etc.) and expands ±5 lines of context around each
+- PoC prober uses HTTP GET reflection checks only — no client-side execution, no JS injection
+- Shell commands run via `subprocess` with a 30-second timeout
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+_Populate as you build._
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
-
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- Only test sites you own or have written authorization to test
+- DeepSeek R1 via OpenRouter can take 20–40s per response; this is normal

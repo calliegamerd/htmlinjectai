@@ -1,0 +1,21 @@
+kind = "web"
+previewPath = "/"
+title = "XSS & HTML Injection Analyzer"
+version = "1.0.0"
+id = "artifacts/xss-analyzer"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 5000
+
+[services.development]
+run = "python3 -m streamlit run artifacts/xss-analyzer/app.py --server.port 5000 --server.address 0.0.0.0"
+
+[services.env]
+PORT = "5000"
