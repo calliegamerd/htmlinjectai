@@ -30,7 +30,7 @@ outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = ".pythonlibs/bin/streamlit run artifacts/xss-analyzer/app.py --server.port 5000 --server.address 0.0.0.0"
+args = "python3 -m streamlit run artifacts/xss-analyzer/app.py --server.port 5000 --server.address 0.0.0.0"
 waitForPort = 5000
 
 [agent]
@@ -44,10 +44,6 @@ timeoutMs = 20000
 [[ports]]
 localPort = 5000
 externalPort = 80
-
-[[ports]]
-localPort = 8081
-externalPort = 8081
 
 [nix]
 channel = "stable-25_05"
